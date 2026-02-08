@@ -1,5 +1,4 @@
-import type { TranslatorConfig, TranslatorProvider } from '../types';
-import { clearTranslationCache } from '../services/translators';
+import type { TranslatorConfig } from '../types';
 
 interface SettingsPanelProps {
   config: TranslatorConfig;
@@ -16,21 +15,8 @@ export function SettingsPanel({
 }: SettingsPanelProps) {
   if (!isOpen) return null;
 
-  const handleProviderChange = (provider: TranslatorProvider) => {
-    onConfigChange({ ...config, provider });
-  };
-
   const handleGoogleApiKeyChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     onConfigChange({ ...config, googleApiKey: e.target.value });
-  };
-
-  const handleLibreTranslateUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    onConfigChange({ ...config, libreTranslateUrl: e.target.value });
-  };
-
-  const handleClearCache = () => {
-    clearTranslationCache();
-    alert('Translation cache cleared!');
   };
 
   return (
@@ -52,105 +38,35 @@ export function SettingsPanel({
           </button>
         </div>
 
-        {/* Translation Provider */}
+        {/* Google API Key */}
         <div className="mb-6">
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            Translation Provider
+            Google Translate API Key
           </label>
-          <div className="space-y-2">
-            <label className="flex items-center">
-              <input
-                type="radio"
-                name="provider"
-                value="mymemory"
-                checked={config.provider === 'mymemory'}
-                onChange={() => handleProviderChange('mymemory')}
-                className="mr-2"
-              />
-              <div>
-                <span className="font-medium">MyMemory</span>
-                <span className="text-sm text-gray-500 block">Free, no API key required</span>
-              </div>
-            </label>
-            <label className="flex items-center">
-              <input
-                type="radio"
-                name="provider"
-                value="libretranslate"
-                checked={config.provider === 'libretranslate'}
-                onChange={() => handleProviderChange('libretranslate')}
-                className="mr-2"
-              />
-              <div>
-                <span className="font-medium">LibreTranslate</span>
-                <span className="text-sm text-gray-500 block">Free, open source</span>
-              </div>
-            </label>
-            <label className="flex items-center">
-              <input
-                type="radio"
-                name="provider"
-                value="google"
-                checked={config.provider === 'google'}
-                onChange={() => handleProviderChange('google')}
-                className="mr-2"
-              />
-              <div>
-                <span className="font-medium">Google Translate</span>
-                <span className="text-sm text-gray-500 block">Requires API key</span>
-              </div>
-            </label>
-          </div>
+          <input
+            type="password"
+            value={config.googleApiKey || ''}
+            onChange={handleGoogleApiKeyChange}
+            placeholder="Enter your API key"
+            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Required for translations. Get from Google Cloud Console
+          </p>
         </div>
 
-        {/* LibreTranslate URL */}
-        {config.provider === 'libretranslate' && (
-          <div className="mb-6">
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              LibreTranslate URL
-            </label>
-            <input
-              type="url"
-              value={config.libreTranslateUrl || ''}
-              onChange={handleLibreTranslateUrlChange}
-              placeholder="https://libretranslate.com/translate"
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Leave empty to use the default public instance
-            </p>
-          </div>
-        )}
-
-        {/* Google API Key */}
-        {config.provider === 'google' && (
-          <div className="mb-6">
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Google API Key
-            </label>
-            <input
-              type="password"
-              value={config.googleApiKey || ''}
-              onChange={handleGoogleApiKeyChange}
-              placeholder="Enter your API key"
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Get an API key from the Google Cloud Console
-            </p>
-          </div>
-        )}
-
-        {/* Clear Cache */}
+        {/* Info */}
         <div className="border-t pt-6">
-          <button
-            onClick={handleClearCache}
-            className="w-full px-4 py-2 text-sm text-gray-700 border border-gray-300 rounded-md hover:bg-gray-50"
-          >
-            Clear Translation Cache
-          </button>
-          <p className="text-xs text-gray-500 mt-1">
-            Translations are cached locally to reduce API calls
+          <h3 className="text-sm font-medium text-gray-700 mb-2">About</h3>
+          <p className="text-xs text-gray-500">
+            This app transcribes Russian videos using OpenAI Whisper and provides
+            click-to-translate functionality using Google Translate.
+          </p>
+          <p className="text-xs text-gray-500 mt-2">
+            Translations are cached on the server to reduce API calls.
+          </p>
+          <p className="text-xs text-gray-500 mt-2">
+            OpenAI API key is configured on the server.
           </p>
         </div>
       </div>
