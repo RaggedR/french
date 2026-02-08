@@ -1,0 +1,16 @@
+FROM gcr.io/book-friend-finder/russian-base:latest
+
+WORKDIR /app
+
+# Copy package files and install dependencies
+COPY package*.json ./
+RUN npm install --production
+
+# Copy application code
+COPY . .
+
+# Cloud Run uses PORT env var
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["node", "index.js"]
