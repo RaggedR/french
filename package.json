@@ -1,17 +1,20 @@
 {
-  "name": "french",
+  "name": "russian-video-transcription",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "dev:frontend": "vite",
+    "dev:backend": "cd server && npm run dev",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server:install": "cd server && npm install"
   },
   "dependencies": {
-    "jszip": "^3.10.1",
-    "pdfjs-dist": "^5.4.530",
+    "@vimeo/player": "^2.30.2",
+    "hls.js": "^1.6.15",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
@@ -21,7 +24,9 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
+    "@types/youtube": "^0.1.2",
     "@vitejs/plugin-react": "^5.1.1",
+    "concurrently": "^9.1.2",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",

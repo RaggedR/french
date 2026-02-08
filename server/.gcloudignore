@@ -1,0 +1,10 @@
+# Ignore node_modules - will be installed during build
+node_modules/
+
+# Ignore temp files
+temp/
+*.log
+
+# Git
+.git/
+.gitignore
