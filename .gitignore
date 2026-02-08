@@ -8,6 +8,11 @@
 .firebase/
 firebase-debug.log
 
+# Server temp files (downloaded videos, audio)
+server/temp/
+server/*.mp3
+server/*.vtt
+
 # Logs
 logs
 *.log
