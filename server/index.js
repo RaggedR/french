@@ -9,6 +9,7 @@ import dotenv from 'dotenv';
 import { Storage } from '@google-cloud/storage';
 import { spawn } from 'child_process';
 import { createChunks, getChunkTranscript, formatTime } from './chunking.js';
+import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk } from './media.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -569,10 +570,25 @@ app.get('/api/video-proxy', async (req, res) => {
   }
 });
 
+// Batch settings for audio downloads
+const DOWNLOAD_BUFFER = 20 * 60;  // Download 20 min of audio (5 chunks × 3 min = 15 min + 5 min buffer)
+const CHUNKS_PER_BATCH = 5;       // Show 5 chunks at a time (~15 min)
+const MIN_FINAL_CHUNK = 120;      // Minimum final chunk duration in seconds (merge if shorter)
+
+/**
+ * Create progress callback for a session
+ */
+function createProgressCallback(sessionId) {
+  return (type, percent, status, message) => {
+    sendProgress(sessionId, type, percent, status, message);
+  };
+}
+
 /**
  * POST /api/analyze
- * Phase 1: Download audio, transcribe, create chunks
- * Returns: { sessionId, title, totalDuration, chunks: [...] }
+ * Downloads first batch of audio (~25 min), transcribes, creates chunks
+ * Returns: { sessionId, status: 'started' }
+ * Progress sent via SSE, completion includes hasMoreChunks flag
  */
 app.post('/api/analyze', async (req, res) => {
   const { url } = req.body;
@@ -592,36 +608,32 @@ app.post('/api/analyze', async (req, res) => {
     fs.mkdirSync(tempDir, { recursive: true });
   }
 
-  const videoPath = path.join(tempDir, `source_${sessionId}.mp4`);
-  const audioPath = path.join(tempDir, `audio_${sessionId}.mp3`);
-
   // Initialize session
   analysisSessions.set(sessionId, {
     status: 'downloading',
     url,
-    videoPath,
-    audioPath,
     progress: { audio: 0, transcription: 0 },
   });
 
   // Send initial response with session ID
   res.json({ sessionId, status: 'started' });
 
-  // Process in background
-  try {
-    console.log(`[Analyze] Session ${sessionId}: Starting audio download`);
+  // Process in background - small delay to allow SSE connection
+  setTimeout(async () => {
+    try {
+      console.log(`[Analyze] Session ${sessionId}: Starting audio download`);
 
-    // Send immediate progress - user sees something right away
-    sendProgress(sessionId, 'audio', 1, 'active', 'Connecting to ok.ru...');
+      // Send immediate progress
+      sendProgress(sessionId, 'audio', 1, 'active', 'Connecting to ok.ru...');
 
-    // Animate progress during the slow dumpJson phase (10-20 seconds for ok.ru)
+    // Animate progress during the slow dumpJson phase
     let connectProgress = 1;
     const connectInterval = setInterval(() => {
       connectProgress = Math.min(connectProgress + 1, 10);
       sendProgress(sessionId, 'audio', connectProgress, 'active', 'Fetching video info...');
     }, 2000);
 
-    // Get video info first (this takes 10-20 seconds for ok.ru)
+    // Get video info first
     const info = await ytdlp(url, {
       dumpJson: true,
       noWarnings: true,
@@ -629,139 +641,201 @@ app.post('/api/analyze', async (req, res) => {
 
     clearInterval(connectInterval);
     const title = info.title || 'Untitled Video';
-    const duration = info.duration || 0;
-    const durationMin = Math.round(duration / 60);
-    sendProgress(sessionId, 'audio', 12, 'active', `Downloading ${durationMin}min video...`);
+    const totalDuration = info.duration || 0;
+    const totalDurationMin = Math.round(totalDuration / 60);
 
-    // Watch file size for real progress (estimate ~15KB/s per minute of video)
-    const expectedSize = duration * 15000; // rough estimate
-    let lastSize = 0;
-    const progressInterval = setInterval(() => {
-      try {
-        const partPath = videoPath + '.part';
-        const currentPath = fs.existsSync(partPath) ? partPath : (fs.existsSync(videoPath) ? videoPath : null);
-        if (currentPath) {
-          const stats = fs.statSync(currentPath);
-          const currentSize = stats.size;
-          if (currentSize > lastSize) {
-            lastSize = currentSize;
-            // Progress from 12% to 70% based on file size
-            const downloadProgress = Math.min(12 + (currentSize / expectedSize) * 58, 70);
-            const sizeMB = (currentSize / 1024 / 1024).toFixed(1);
-            sendProgress(sessionId, 'audio', Math.round(downloadProgress), 'active', `Downloaded ${sizeMB}MB...`);
-          }
-        }
-      } catch (e) {
-        // Ignore file access errors
-      }
-    }, 2000);
+    // Download up to 30 min of audio (buffer for smart chunking)
+    const downloadEndTime = Math.min(DOWNLOAD_BUFFER, totalDuration);
+    const downloadDurationMin = Math.round(downloadEndTime / 60);
 
-    await ytdlp(url, {
-      format: 'worst[ext=mp4]/worst',
-      output: videoPath,
-      noWarnings: true,
-      concurrentFragments: 4,
-    });
+    console.log(`[Analyze] Session ${sessionId}: Total ${totalDurationMin}min, downloading first ${downloadDurationMin}min`);
 
-    clearInterval(progressInterval);
-    sendProgress(sessionId, 'audio', 75, 'active', 'Extracting audio...');
+    // Download first batch of audio
+    const audioPath = path.join(tempDir, `audio_${sessionId}_batch0.mp3`);
+    const onProgress = createProgressCallback(sessionId);
+    const { size: audioSize } = await downloadAudioChunk(url, audioPath, 0, downloadEndTime, { onProgress });
+    console.log(`[Analyze] Session ${sessionId}: First batch downloaded (${(audioSize / 1024 / 1024).toFixed(1)} MB)`);
 
-    // Extract audio from the downloaded video using ffmpeg
-    await new Promise((resolve, reject) => {
-      const ffmpegProc = spawn('ffmpeg', [
-        '-i', videoPath,
-        '-vn',
-        '-acodec', 'libmp3lame',
-        '-q:a', '5',
-        '-y',
-        audioPath,
-      ]);
-      ffmpegProc.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg audio extraction failed with code ${code}`));
-      });
-      ffmpegProc.on('error', reject);
-    });
+    // Transcribe audio
+    const fullBatchTranscript = await transcribeAudioChunk(audioPath, { onProgress });
 
-    sendProgress(sessionId, 'audio', 100, 'complete', 'Audio ready');
-    console.log(`[Analyze] Session ${sessionId}: Audio downloaded`);
-
-    // Transcribe
-    sendProgress(sessionId, 'transcription', 10, 'active', 'Sending to Whisper...');
-
-    // Simulate progress while Whisper works
-    let transcriptionProgress = 10;
-    const transcriptionInterval = setInterval(() => {
-      transcriptionProgress = Math.min(transcriptionProgress + 8, 90);
-      sendProgress(sessionId, 'transcription', transcriptionProgress, 'active', 'Transcribing audio...');
-    }, 2000);
-
-    const openai = new OpenAI({ apiKey });
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: 'whisper-1',
-      response_format: 'verbose_json',
-      timestamp_granularities: ['word', 'segment'],
-      language: 'ru',
-    });
-
-    clearInterval(transcriptionInterval);
-    sendProgress(sessionId, 'transcription', 100, 'complete', 'Transcription complete');
-    console.log(`[Analyze] Session ${sessionId}: Transcription complete`);
-
-    // Clean up audio file (keep video for chunk extraction)
+    // Clean up audio file
     fs.unlinkSync(audioPath);
 
-    // Create transcript object
+    // Smart chunk the entire downloaded portion
+    const allChunks = createChunks(fullBatchTranscript);
+    console.log(`[Analyze] Session ${sessionId}: Smart chunking created ${allChunks.length} chunks from ${downloadDurationMin}min`);
+
+    // Take first N chunks for this batch
+    const chunksToShow = allChunks.slice(0, CHUNKS_PER_BATCH);
+    const lastShownChunk = chunksToShow[chunksToShow.length - 1];
+    const batchEndTime = lastShownChunk ? lastShownChunk.endTime : downloadEndTime;
+
+    // Determine if there's more content after these chunks
+    const hasMoreChunks = batchEndTime < totalDuration;
+
+    // Build transcript containing only the words/segments for shown chunks
     const transcript = {
-      words: transcription.words || [],
-      segments: transcription.segments || [],
-      language: transcription.language || 'ru',
-      duration: transcription.duration || 0,
+      words: fullBatchTranscript.words.filter(w => w.end <= batchEndTime),
+      segments: fullBatchTranscript.segments.filter(s => s.end <= batchEndTime),
+      language: fullBatchTranscript.language,
+      duration: batchEndTime,
     };
 
-    // Create chunks with status tracking
-    const rawChunks = createChunks(transcript);
-    const chunks = rawChunks.map(chunk => ({
+    // Add status to chunks
+    const chunks = chunksToShow.map(chunk => ({
       ...chunk,
-      status: 'pending',  // 'pending' | 'downloading' | 'ready'
+      status: 'pending',
       videoUrl: null,
     }));
-    console.log(`[Analyze] Session ${sessionId}: Created ${chunks.length} chunks`);
 
-    // Store session data for chunk downloads
+    console.log(`[Analyze] Session ${sessionId}: Showing ${chunks.length} chunks (ends at ${formatTime(batchEndTime)}), hasMore: ${hasMoreChunks}`);
+
+    // Store session data
     analysisSessions.set(sessionId, {
       status: 'ready',
       url,
-      videoPath,
       title,
       transcript,
       chunks,
-      totalDuration: transcript.duration,
-      chunkTranscripts: new Map(),  // Map<chunkId, Transcript>
+      totalDuration,
+      nextBatchStartTime: hasMoreChunks ? batchEndTime : null,  // Start next batch from end of last shown chunk
+      hasMoreChunks,
+      chunkTranscripts: new Map(),
     });
 
     // Send completion event
     sendProgress(sessionId, 'complete', 100, 'complete', 'Analysis complete', {
       title,
-      totalDuration: transcript.duration,
+      totalDuration,
       chunks,
+      hasMoreChunks,
+    });
+
+    } catch (error) {
+      console.error(`[Analyze] Session ${sessionId} error:`, error);
+
+      analysisSessions.set(sessionId, {
+        status: 'error',
+        error: error.message,
+      });
+
+      sendProgress(sessionId, 'error', 0, 'error', error.message);
+    }
+  }, 500); // 500ms delay to allow SSE connection
+});
+
+/**
+ * POST /api/load-more-chunks
+ * Downloads next batch of audio, transcribes, appends chunks
+ * Request: { sessionId }
+ * Returns: { chunks: [...new chunks...], hasMoreChunks }
+ */
+app.post('/api/load-more-chunks', async (req, res) => {
+  const { sessionId } = req.body;
+
+  console.log(`[LoadMore] Request for session ${sessionId}`);
+
+  const session = analysisSessions.get(sessionId);
+  if (!session) {
+    console.log(`[LoadMore] Session ${sessionId} not found`);
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  if (session.status !== 'ready') {
+    console.log(`[LoadMore] Session ${sessionId} not ready, status: ${session.status}`);
+    return res.status(404).json({ error: 'Session not ready' });
+  }
+
+  console.log(`[LoadMore] Session state - hasMoreChunks: ${session.hasMoreChunks}, nextBatchStartTime: ${session.nextBatchStartTime}`);
+
+  if (!session.hasMoreChunks || session.nextBatchStartTime === null) {
+    console.log(`[LoadMore] No more chunks to load`);
+    return res.status(400).json({ error: 'No more chunks to load' });
+  }
+
+  const tempDir = path.join(__dirname, 'temp');
+  const batchIndex = session.chunks.length;
+  const audioPath = path.join(tempDir, `audio_${sessionId}_batch${batchIndex}.mp3`);
+
+  try {
+    const startTime = session.nextBatchStartTime;
+    // Download 30 min buffer (or rest of video if less)
+    const downloadEndTime = Math.min(startTime + DOWNLOAD_BUFFER, session.totalDuration);
+
+    console.log(`[LoadMore] Session ${sessionId}: Downloading ${formatTime(startTime)} - ${formatTime(downloadEndTime)}`);
+
+    // Download this batch of audio
+    const onProgress = createProgressCallback(sessionId);
+    await downloadAudioChunk(session.url, audioPath, startTime, downloadEndTime, { onProgress });
+
+    // Transcribe audio
+    const rawTranscript = await transcribeAudioChunk(audioPath, { onProgress });
+
+    // Clean up audio
+    fs.unlinkSync(audioPath);
+
+    // Smart chunk the downloaded portion
+    const allChunks = createChunks(rawTranscript);
+    console.log(`[LoadMore] Session ${sessionId}: Smart chunking created ${allChunks.length} chunks`);
+
+    // Take first N chunks
+    const chunksToShow = allChunks.slice(0, CHUNKS_PER_BATCH);
+    const lastShownChunk = chunksToShow[chunksToShow.length - 1];
+    const batchEndTime = lastShownChunk
+      ? startTime + lastShownChunk.endTime  // Offset by startTime
+      : downloadEndTime;
+
+    // Check if there's more content
+    const hasMoreAfterThis = batchEndTime < session.totalDuration;
+
+    // Adjust chunk IDs, indices, and timestamps (offset by startTime)
+    const existingChunkCount = session.chunks.length;
+    const newChunks = chunksToShow.map((chunk, i) => ({
+      ...chunk,
+      id: `chunk-${existingChunkCount + i}`,
+      index: existingChunkCount + i,
+      startTime: chunk.startTime + startTime,
+      endTime: chunk.endTime + startTime,
+      status: 'pending',
+      videoUrl: null,
+    }));
+
+    // Build transcript with adjusted timestamps for the shown chunks only
+    const newWords = rawTranscript.words
+      .filter(w => w.end <= (lastShownChunk?.endTime || rawTranscript.duration))
+      .map(w => ({ ...w, start: w.start + startTime, end: w.end + startTime }));
+    const newSegments = rawTranscript.segments
+      .filter(s => s.end <= (lastShownChunk?.endTime || rawTranscript.duration))
+      .map(s => ({ ...s, start: s.start + startTime, end: s.end + startTime }));
+
+    // Extend session
+    session.transcript.words.push(...newWords);
+    session.transcript.segments.push(...newSegments);
+    session.chunks.push(...newChunks);
+    session.nextBatchStartTime = hasMoreAfterThis ? batchEndTime : null;
+    session.hasMoreChunks = hasMoreAfterThis;
+
+    console.log(`[LoadMore] Session ${sessionId}: Added ${newChunks.length} chunks (ends at ${formatTime(batchEndTime)}), hasMore: ${hasMoreAfterThis}`);
+
+    sendProgress(sessionId, 'complete', 100, 'complete', 'More chunks loaded', {
+      newChunks,
+      hasMoreChunks: hasMoreAfterThis,
+    });
+
+    res.json({
+      chunks: newChunks,
+      hasMoreChunks: hasMoreAfterThis,
     });
 
   } catch (error) {
-    console.error(`[Analyze] Session ${sessionId} error:`, error);
+    console.error(`[LoadMore] Session ${sessionId} error:`, error);
 
-    // Clean up
     if (fs.existsSync(audioPath)) {
       fs.unlinkSync(audioPath);
     }
 
-    analysisSessions.set(sessionId, {
-      status: 'error',
-      error: error.message,
-    });
-
     sendProgress(sessionId, 'error', 0, 'error', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -773,9 +847,12 @@ app.get('/api/progress/:sessionId', (req, res) => {
   const { sessionId } = req.params;
 
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Cache-Control');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering if present
+  res.flushHeaders(); // Flush headers immediately
 
   // Store the client connection
   if (!progressClients.has(sessionId)) {
@@ -788,18 +865,15 @@ app.get('/api/progress/:sessionId', (req, res) => {
   // Send initial connection event
   res.write(`data: ${JSON.stringify({ type: 'connected', sessionId })}\n\n`);
 
-  // Check if session already has results
+  // Send heartbeat every 15 seconds to keep connection alive
+  const heartbeat = setInterval(() => {
+    res.write(`: heartbeat\n\n`);
+  }, 15000);
+
+  // Only send cached results if explicitly requested (for page refresh recovery)
+  // Don't auto-send 'complete' as it breaks chunk download progress subscriptions
   const session = analysisSessions.get(sessionId);
-  if (session?.status === 'ready') {
-    res.write(`data: ${JSON.stringify({
-      type: 'complete',
-      progress: 100,
-      status: 'complete',
-      title: session.title,
-      totalDuration: session.totalDuration,
-      chunks: session.chunks,
-    })}\n\n`);
-  } else if (session?.status === 'error') {
+  if (session?.status === 'error') {
     res.write(`data: ${JSON.stringify({
       type: 'error',
       progress: 0,
@@ -811,6 +885,7 @@ app.get('/api/progress/:sessionId', (req, res) => {
   // Clean up on client disconnect
   req.on('close', () => {
     console.log(`[SSE] Client disconnected for session ${sessionId}`);
+    clearInterval(heartbeat);
     const clients = progressClients.get(sessionId);
     if (clients) {
       const index = clients.indexOf(res);
@@ -831,9 +906,12 @@ function sendProgress(sessionId, type, progress, status, message, extra = {}) {
   const clients = progressClients.get(sessionId);
   if (clients && clients.length > 0) {
     const data = JSON.stringify({ type, progress, status, message, ...extra });
+    console.log(`[SSE] Sending to ${clients.length} clients: ${type} ${progress}% - ${message}`);
     clients.forEach(client => {
       client.write(`data: ${data}\n\n`);
     });
+  } else {
+    console.log(`[SSE] No clients for session ${sessionId}, cannot send: ${type} - ${message}`);
   }
 }
 
@@ -854,6 +932,7 @@ app.get('/api/session/:sessionId', (req, res) => {
       title: session.title,
       totalDuration: session.totalDuration,
       originalUrl: session.url,
+      hasMoreChunks: session.hasMoreChunks || false,
       chunks: session.chunks.map(chunk => ({
         id: chunk.id,
         index: chunk.index,
@@ -951,12 +1030,6 @@ app.post('/api/download-chunk', async (req, res) => {
   // Get startTime/endTime from the chunk (not from request body)
   const { startTime, endTime } = chunk;
 
-  // Use the video we already downloaded during analysis
-  const sourceVideoPath = session.videoPath;
-  if (!sourceVideoPath || !fs.existsSync(sourceVideoPath)) {
-    return res.status(404).json({ error: 'Source video not found - please re-analyze' });
-  }
-
   // Mark chunk as downloading
   chunk.status = 'downloading';
 
@@ -967,44 +1040,10 @@ app.post('/api/download-chunk', async (req, res) => {
     const partNum = parseInt(chunkId.split('-')[1]) + 1;
     console.log(`[Download-Chunk] Session ${sessionId}, Chunk ${chunkId}: ${formatTime(startTime)} - ${formatTime(endTime)}`);
 
-    // No need to download - we already have the video from analysis phase
-    sendProgress(sessionId, 'video', 20, 'active', `Extracting Part ${partNum}...`);
-
-    // Use ffmpeg to extract the chunk (accurate seek: -ss after -i)
-    await new Promise((resolve, reject) => {
-      const duration = endTime - startTime;
-      const ffmpeg = spawn('ffmpeg', [
-        '-i', sourceVideoPath,
-        '-ss', startTime.toString(),
-        '-t', duration.toString(),
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-c:a', 'aac',
-        '-avoid_negative_ts', 'make_zero',
-        '-y',
-        chunkPath,
-      ]);
-
-      let stderr = '';
-      ffmpeg.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      ffmpeg.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
-        }
-      });
-
-      ffmpeg.on('error', reject);
-    });
-
-    sendProgress(sessionId, 'video', 80, 'active', 'Processing...');
-    console.log(`[Download-Chunk] Session ${sessionId}: Chunk extracted`);
-
-    // Note: Keep source video for other chunks (don't delete)
+    // Download video chunk
+    const onProgress = createProgressCallback(sessionId);
+    const { size: videoSize } = await downloadVideoChunk(session.url, chunkPath, startTime, endTime, { onProgress, partNum });
+    console.log(`[Download-Chunk] Session ${sessionId}: Chunk downloaded (${(videoSize / 1024 / 1024).toFixed(1)} MB)`);
 
     // Get chunk transcript with adjusted timestamps
     const chunkTranscript = getChunkTranscript(session.transcript, startTime, endTime);

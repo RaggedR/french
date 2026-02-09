@@ -1,49 +1,63 @@
+import type { ProgressState } from '../types';
+
 interface ProgressBarProps {
-  label: string;
-  progress: number;
-  status: 'active' | 'complete' | 'error';
-  message?: string;
+  progress: ProgressState[];
 }
 
-export function ProgressBar({ label, progress, status, message }: ProgressBarProps) {
-  const isComplete = status === 'complete';
-  const isError = status === 'error';
+const typeLabels: Record<ProgressState['type'], string> = {
+  audio: 'Audio',
+  transcription: 'Transcription',
+  video: 'Video',
+};
+
+const typeColors: Record<ProgressState['type'], string> = {
+  audio: 'bg-blue-500',
+  transcription: 'bg-green-500',
+  video: 'bg-purple-500',
+};
+
+export function ProgressBar({ progress }: ProgressBarProps) {
+  if (progress.length === 0) {
+    return null;
+  }
 
   return (
-    <div className={`transition-opacity duration-300 ${isComplete ? 'opacity-60' : 'opacity-100'}`}>
-      <div className="flex justify-between items-center mb-1">
-        <span className="text-sm font-medium text-gray-700">{label}</span>
-        <span className="text-sm text-gray-500">
-          {isComplete ? (
-            <svg className="w-5 h-5 text-green-500 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-            </svg>
-          ) : isError ? (
-            <svg className="w-5 h-5 text-red-500 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          ) : (
-            `${Math.round(progress)}%`
+    <div className="w-full max-w-md mx-auto space-y-4">
+      {progress.map((p) => (
+        <div key={p.type} className="space-y-2">
+          <div className="flex justify-between text-sm">
+            <span className="font-medium text-gray-700">
+              {typeLabels[p.type]}
+            </span>
+            <span className="text-gray-500">
+              {p.status === 'complete' ? '100%' : `${p.progress}%`}
+            </span>
+          </div>
+
+          {/* Progress bar */}
+          <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+            <div
+              className={`h-full transition-all duration-300 ${
+                p.status === 'complete'
+                  ? 'bg-green-500'
+                  : p.status === 'error'
+                  ? 'bg-red-500'
+                  : typeColors[p.type]
+              }`}
+              style={{ width: `${p.status === 'complete' ? 100 : p.progress}%` }}
+            />
+          </div>
+
+          {/* Message */}
+          {p.message && (
+            <p className={`text-sm ${
+              p.status === 'error' ? 'text-red-600' : 'text-gray-500'
+            }`}>
+              {p.message}
+            </p>
           )}
-        </span>
-      </div>
-      <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-        <div
-          className={`h-full rounded-full transition-all duration-300 ${
-            isError
-              ? 'bg-red-500'
-              : isComplete
-              ? 'bg-green-500'
-              : 'bg-blue-500'
-          }`}
-          style={{ width: `${progress}%` }}
-        />
-      </div>
-      {message && (
-        <p className={`text-xs mt-1 ${isError ? 'text-red-600' : 'text-gray-500'}`}>
-          {message}
-        </p>
-      )}
+        </div>
+      ))}
     </div>
   );
 }

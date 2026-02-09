@@ -4,8 +4,8 @@ import { VideoPlayer } from './components/VideoPlayer';
 import { TranscriptPanel } from './components/TranscriptPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 import { ChunkMenu } from './components/ChunkMenu';
-import { ProgressStack } from './components/ProgressStack';
-import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk } from './services/api';
+import { ProgressBar } from './components/ProgressBar';
+import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk, loadMoreChunks } from './services/api';
 import type {
   TranslatorConfig,
   WordTimestamp,
@@ -46,6 +46,8 @@ function App() {
   const [sessionTitle, setSessionTitle] = useState<string>('');
   const [sessionTotalDuration, setSessionTotalDuration] = useState<number>(0);
   const [sessionChunks, setSessionChunks] = useState<VideoChunk[]>([]);
+  const [hasMoreChunks, setHasMoreChunks] = useState<boolean>(false);
+  const [isLoadingMore, setIsLoadingMore] = useState<boolean>(false);
   const [originalUrl, setOriginalUrl] = useState<string>('');
 
   // Current playback state (for active chunk)
@@ -85,6 +87,12 @@ function App() {
   const handleSelectChunk = useCallback(async (chunk: VideoChunk, sessionIdOverride?: string) => {
     const activeSessionId = sessionIdOverride || sessionId;
     if (!activeSessionId) return;
+
+    // Clean up any existing SSE subscription
+    if (progressCleanupRef.current) {
+      progressCleanupRef.current();
+      progressCleanupRef.current = null;
+    }
 
     // If chunk is already ready, fetch and play immediately
     if (chunk.status === 'ready') {
@@ -192,6 +200,7 @@ function App() {
           // Analysis complete - store session info
           setSessionTitle(data.title);
           setSessionTotalDuration(data.totalDuration);
+          setHasMoreChunks(data.hasMoreChunks);
           // Add status to chunks from server response
           const chunksWithStatus = data.chunks.map(c => ({
             ...c,
@@ -202,8 +211,8 @@ function App() {
 
           setProgress([]);
 
-          // If only one chunk, download directly; otherwise show menu
-          if (chunksWithStatus.length === 1) {
+          // If only one chunk and no more to load, download directly; otherwise show menu
+          if (chunksWithStatus.length === 1 && !data.hasMoreChunks) {
             // Use setTimeout to avoid calling handleSelectChunk during render
             // Pass newSessionId explicitly since state might not be updated yet
             setTimeout(() => {
@@ -243,6 +252,7 @@ function App() {
         const session = await getSession(sessionId);
         if (session.status === 'ready' && session.chunks) {
           setSessionChunks(session.chunks);
+          setHasMoreChunks(session.hasMoreChunks || false);
         }
       } catch {
         // Ignore errors, use cached chunks
@@ -257,6 +267,69 @@ function App() {
     setView('chunk-menu');
   }, [sessionId]);
 
+  const handleLoadMore = useCallback(async () => {
+    if (!sessionId || isLoadingMore) return;
+
+    // Clean up any existing SSE subscription
+    if (progressCleanupRef.current) {
+      progressCleanupRef.current();
+      progressCleanupRef.current = null;
+    }
+
+    setIsLoadingMore(true);
+    setError(null);
+    setProgress([
+      { type: 'audio', progress: 0, status: 'active', message: 'Starting...' },
+    ]);
+
+    // Subscribe to progress updates for load more
+    const cleanup = subscribeToProgress(
+      sessionId,
+      (progressUpdate) => {
+        setProgress((prev) => {
+          const existing = prev.find((p) => p.type === progressUpdate.type);
+          if (existing) {
+            return prev.map((p) =>
+              p.type === progressUpdate.type ? progressUpdate : p
+            );
+          }
+          return [...prev, progressUpdate];
+        });
+      },
+      () => {
+        // Not used for load more - we handle completion via API response
+      },
+      (errorMessage) => {
+        setError(errorMessage);
+        setProgress([]);
+      }
+    );
+
+    progressCleanupRef.current = cleanup;
+
+    try {
+      const result = await loadMoreChunks(sessionId);
+
+      // Append new chunks to existing ones
+      setSessionChunks(prev => [
+        ...prev,
+        ...result.chunks.map(c => ({
+          ...c,
+          status: c.status || 'pending' as const,
+          videoUrl: c.videoUrl || null,
+        })),
+      ]);
+      setHasMoreChunks(result.hasMoreChunks);
+      setProgress([]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load more chunks');
+      setProgress([]);
+    } finally {
+      setIsLoadingMore(false);
+      if (cleanup) cleanup();
+    }
+  }, [sessionId, isLoadingMore]);
+
   const handleReset = useCallback(() => {
     // Clean up SSE subscription
     if (progressCleanupRef.current) {
@@ -269,6 +342,8 @@ function App() {
     setSessionTitle('');
     setSessionTotalDuration(0);
     setSessionChunks([]);
+    setHasMoreChunks(false);
+    setIsLoadingMore(false);
     setOriginalUrl('');
     setVideoUrl(null);
     setTranscript(null);
@@ -343,7 +418,12 @@ function App() {
                 Downloading and transcribing audio...
               </p>
             </div>
-            <ProgressStack progress={progress} />
+            <ProgressBar progress={progress} />
+            {progress.length === 0 && (
+              <div className="flex justify-center">
+                <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-blue-500 border-t-transparent"></div>
+              </div>
+            )}
             {error && (
               <div className="max-w-md mx-auto p-4 bg-red-50 border border-red-200 rounded-lg">
                 <p className="text-red-700 text-sm">{error}</p>
@@ -360,13 +440,29 @@ function App() {
 
         {/* Chunk menu view */}
         {view === 'chunk-menu' && sessionChunks.length > 0 && (
-          <ChunkMenu
-            title={sessionTitle}
-            totalDuration={sessionTotalDuration}
-            chunks={sessionChunks}
-            onSelectChunk={handleSelectChunk}
-            onReset={handleReset}
-          />
+          <div className="space-y-6">
+            <ChunkMenu
+              title={sessionTitle}
+              totalDuration={sessionTotalDuration}
+              chunks={sessionChunks}
+              hasMoreChunks={hasMoreChunks}
+              isLoadingMore={isLoadingMore}
+              onSelectChunk={handleSelectChunk}
+              onLoadMore={handleLoadMore}
+              onReset={handleReset}
+            />
+            {/* Show progress when loading more */}
+            {isLoadingMore && (
+              <div className="py-4">
+                <ProgressBar progress={progress} />
+                {progress.length === 0 && (
+                  <div className="flex justify-center">
+                    <div className="inline-block animate-spin rounded-full h-8 w-8 border-4 border-blue-500 border-t-transparent"></div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         {/* Loading chunk view */}
@@ -380,7 +476,12 @@ function App() {
                 Preparing video for playback...
               </p>
             </div>
-            <ProgressStack progress={progress} />
+            <ProgressBar progress={progress} />
+            {progress.length === 0 && (
+              <div className="flex justify-center">
+                <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-blue-500 border-t-transparent"></div>
+              </div>
+            )}
             <div className="text-center">
               <button
                 onClick={handleBackToChunks}

@@ -5,6 +5,7 @@
 
 const TARGET_CHUNK_DURATION = 180; // 3 minutes
 const MIN_GAP_FOR_BREAK = 0.5; // seconds of silence to consider a natural break
+const MIN_FINAL_CHUNK_DURATION = 120; // 2 minutes - merge final chunk if shorter
 
 /**
  * Create smart chunks from Whisper transcript segments
@@ -91,13 +92,32 @@ export function createChunks(transcript) {
   // Handle remaining segments
   if (currentChunk.segments.length > 0) {
     const lastSegment = currentChunk.segments[currentChunk.segments.length - 1];
-    chunks.push(createChunkObject(
-      chunks.length,
-      currentChunk.startTime,
-      lastSegment.end,
-      currentChunk.segments,
-      currentChunk.words
-    ));
+    const remainingDuration = lastSegment.end - currentChunk.startTime;
+
+    // If final chunk is too short, merge with previous chunk
+    if (remainingDuration < MIN_FINAL_CHUNK_DURATION && chunks.length > 0) {
+      // Merge with previous chunk
+      const prevChunk = chunks[chunks.length - 1];
+      const mergedChunk = createChunkObject(
+        prevChunk.index,
+        prevChunk.startTime,
+        lastSegment.end,
+        [], // We don't track segments in chunk object, just use preview from merged
+        [...(prevChunk._words || []), ...currentChunk.words]
+      );
+      // Update preview to include both parts
+      mergedChunk.previewText = prevChunk.previewText;
+      mergedChunk.wordCount = prevChunk.wordCount + currentChunk.words.length;
+      chunks[chunks.length - 1] = mergedChunk;
+    } else {
+      chunks.push(createChunkObject(
+        chunks.length,
+        currentChunk.startTime,
+        lastSegment.end,
+        currentChunk.segments,
+        currentChunk.words
+      ));
+    }
   }
 
   return chunks;
@@ -134,21 +154,22 @@ function createChunkObject(index, startTime, endTime, segments, words) {
 export function getChunkTranscript(transcript, startTime, endTime) {
   const { words, segments, language } = transcript;
 
-  // Filter words within the time range, adjusting timestamps to be relative
+  // Filter words that overlap with the time range (inclusive)
+  // A word is included if any part of it falls within the range
   const chunkWords = (words || [])
-    .filter(w => w.start >= startTime && w.end <= endTime)
+    .filter(w => w.end > startTime && w.start < endTime)
     .map(w => ({
       ...w,
-      start: w.start - startTime,
+      start: Math.max(0, w.start - startTime),
       end: w.end - startTime,
     }));
 
-  // Filter segments within the time range
+  // Filter segments that overlap with the time range (inclusive)
   const chunkSegments = (segments || [])
-    .filter(s => s.start >= startTime && s.end <= endTime)
+    .filter(s => s.end > startTime && s.start < endTime)
     .map(s => ({
       ...s,
-      start: s.start - startTime,
+      start: Math.max(0, s.start - startTime),
       end: s.end - startTime,
     }));
 

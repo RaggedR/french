@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "node test-media.js"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.14.0",
@@ -13,5 +16,8 @@
     "express": "^4.21.2",
     "openai": "^4.77.0",
     "yt-dlp-exec": "^1.0.2"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
   }
 }
