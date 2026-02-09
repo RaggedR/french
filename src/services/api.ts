@@ -1,7 +1,10 @@
-import type { ProgressState, VideoChunk, SessionResponse, ChunkResponse } from '../types';
+import type { ProgressState, VideoChunk, SessionResponse, ChunkResponse, LoadMoreResponse } from '../types';
 
 // API base URL - uses environment variable in production, relative path in development
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+
+// SSE connects directly to backend to avoid proxy buffering issues
+export const SSE_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 export async function apiRequest<T>(
   endpoint: string,
@@ -28,6 +31,7 @@ export interface AnalysisCompleteData {
   title: string;
   totalDuration: number;
   chunks: VideoChunk[];
+  hasMoreChunks: boolean;
 }
 
 export interface ProgressEvent {
@@ -39,6 +43,7 @@ export interface ProgressEvent {
   title?: string;
   totalDuration?: number;
   chunks?: VideoChunk[];
+  hasMoreChunks?: boolean;
 }
 
 /**
@@ -67,9 +72,9 @@ export function subscribeToProgress(
     }
   };
 
-  // Try SSE first
+  // Try SSE first - connect directly to backend to avoid proxy buffering
   try {
-    const url = `${API_BASE_URL}/api/progress/${sessionId}`;
+    const url = `${SSE_BASE_URL}/api/progress/${sessionId}`;
     eventSource = new EventSource(url);
 
     eventSource.onmessage = (event) => {
@@ -82,12 +87,17 @@ export function subscribeToProgress(
           return; // Initial connection event
         }
 
-        if (data.type === 'complete' && data.chunks) {
-          onComplete({
-            title: data.title || 'Untitled',
-            totalDuration: data.totalDuration || 0,
-            chunks: data.chunks,
-          });
+        if (data.type === 'complete') {
+          // Only call onComplete if chunks are included (initial analysis)
+          if (data.chunks) {
+            onComplete({
+              title: data.title || 'Untitled',
+              totalDuration: data.totalDuration || 0,
+              chunks: data.chunks,
+              hasMoreChunks: data.hasMoreChunks || false,
+            });
+          }
+          // Always cleanup on complete
           cleanup();
           return;
         }
@@ -112,16 +122,17 @@ export function subscribeToProgress(
       }
     };
 
-    eventSource.onerror = () => {
+    eventSource.onerror = (e) => {
       if (isClosed) return;
 
-      // SSE failed, fall back to polling
-      console.log('[API] SSE failed, falling back to polling');
-      if (eventSource) {
-        eventSource.close();
+      // EventSource will auto-reconnect, only fall back to polling if readyState is CLOSED
+      if (eventSource?.readyState === EventSource.CLOSED) {
+        console.log('[API] SSE connection closed, falling back to polling');
         eventSource = null;
+        startPolling();
+      } else {
+        console.log('[API] SSE error, will auto-reconnect', e);
       }
-      startPolling();
     };
   } catch {
     // SSE not supported, use polling
@@ -144,11 +155,12 @@ export function subscribeToProgress(
           progress?: { audio: number; transcription: number };
         }>(`/api/session/${sessionId}`);
 
-        if (data.status === 'complete' && data.chunks) {
+        if (data.status === 'ready' && data.chunks) {
           onComplete({
             title: data.title || 'Untitled',
             totalDuration: data.totalDuration || 0,
             chunks: data.chunks,
+            hasMoreChunks: data.hasMoreChunks || false,
           });
           cleanup();
         } else if (data.status === 'error') {
@@ -203,5 +215,15 @@ export async function downloadChunk(
   return apiRequest<ChunkResponse>('/api/download-chunk', {
     method: 'POST',
     body: JSON.stringify({ sessionId, chunkId }),
+  });
+}
+
+/**
+ * Load more chunks (next batch of audio)
+ */
+export async function loadMoreChunks(sessionId: string): Promise<LoadMoreResponse> {
+  return apiRequest<LoadMoreResponse>('/api/load-more-chunks', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId }),
   });
 }

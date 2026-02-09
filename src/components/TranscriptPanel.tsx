@@ -12,21 +12,21 @@ interface TranscriptPanelProps {
 }
 
 // Find the current word index based on video time
+// Keeps previous word highlighted during pauses until next word starts
 function findCurrentWordIndex(words: WordTimestamp[], time: number): number {
+  if (words.length === 0) return -1;
+
+  // Find the last word that has started
+  let lastStartedWord = -1;
   for (let i = 0; i < words.length; i++) {
-    if (time >= words[i].start && time <= words[i].end) {
-      return i;
-    }
-    // If we're between words, highlight the previous one
-    if (i > 0 && time > words[i - 1].end && time < words[i].start) {
-      return i - 1;
+    if (time >= words[i].start) {
+      lastStartedWord = i;
+    } else {
+      break; // Words are in order, no need to continue
     }
   }
-  // If past all words, return the last one
-  if (words.length > 0 && time > words[words.length - 1].end) {
-    return words.length - 1;
-  }
-  return -1;
+
+  return lastStartedWord;
 }
 
 // Check if a character is Cyrillic
@@ -81,10 +81,7 @@ export function TranscriptPanel({
 
   const handleWordClick = useCallback(
     async (word: WordTimestamp, event: React.MouseEvent) => {
-      // Seek video to word start
-      onWordClick(word);
-
-      // Only translate Russian words
+      // Only translate Russian words (no longer seeks video)
       if (!isRussianWord(word.word)) {
         return;
       }
@@ -112,7 +109,7 @@ export function TranscriptPanel({
         setIsTranslating(false);
       }
     },
-    [onWordClick, config.googleApiKey]
+    [config.googleApiKey]
   );
 
   const handleClosePopup = useCallback(() => {

@@ -4,7 +4,10 @@ interface ChunkMenuProps {
   title: string;
   totalDuration: number;
   chunks: VideoChunk[];
+  hasMoreChunks: boolean;
+  isLoadingMore: boolean;
   onSelectChunk: (chunk: VideoChunk) => void;
+  onLoadMore: () => void;
   onReset: () => void;
 }
 
@@ -27,7 +30,10 @@ export function ChunkMenu({
   title,
   totalDuration,
   chunks,
+  hasMoreChunks,
+  isLoadingMore,
   onSelectChunk,
+  onLoadMore,
   onReset,
 }: ChunkMenuProps) {
   return (
@@ -119,6 +125,36 @@ export function ChunkMenu({
           );
         })}
       </div>
+
+      {/* Load More button */}
+      {hasMoreChunks && (
+        <div className="mt-6 text-center">
+          <button
+            onClick={onLoadMore}
+            disabled={isLoadingMore}
+            className={`px-6 py-3 rounded-lg font-medium transition-all ${
+              isLoadingMore
+                ? 'bg-gray-100 text-gray-400 cursor-wait'
+                : 'bg-blue-600 text-white hover:bg-blue-700'
+            }`}
+          >
+            {isLoadingMore ? (
+              <span className="flex items-center gap-2">
+                <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                Loading more parts...
+              </span>
+            ) : (
+              'Load More Parts'
+            )}
+          </button>
+          <p className="text-xs text-gray-500 mt-2">
+            More parts of the video are available
+          </p>
+        </div>
+      )}
     </div>
   );
 }

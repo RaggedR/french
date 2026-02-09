@@ -55,8 +55,15 @@ export interface SessionResponse {
   totalDuration?: number;
   originalUrl?: string;
   chunks?: VideoChunk[];
+  hasMoreChunks?: boolean;
   error?: string;
   progress?: { audio: number; transcription: number };
+}
+
+// Response from POST /api/load-more-chunks
+export interface LoadMoreResponse {
+  chunks: VideoChunk[];
+  hasMoreChunks: boolean;
 }
 
 // Response from GET /api/session/:sessionId/chunk/:chunkId
