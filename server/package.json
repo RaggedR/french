@@ -5,8 +5,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node test-media.js",
-    "test:unit": "vitest run --testNamePattern=unit"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "node test-media.js"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.14.0",

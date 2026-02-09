@@ -8,6 +8,37 @@ import { formatTime } from './chunking.js';
 const ytdlp = ytdlpBase.create('yt-dlp');
 
 /**
+ * Create a heartbeat interval that calls onProgress with incrementing seconds.
+ * Returns an object with stop() method and isStopped() check.
+ * @param {function} onProgress - Progress callback (type, percent, status, message)
+ * @param {string} type - Progress type ('audio', 'video', 'transcription')
+ * @param {function} messageBuilder - Function that takes seconds and returns message string
+ * @param {number} intervalMs - Interval in milliseconds (default: 1000)
+ * @returns {{stop: function, isStopped: function}}
+ */
+export function createHeartbeat(onProgress, type, messageBuilder, intervalMs = 1000) {
+  let seconds = 0;
+  let stopped = false;
+
+  const interval = setInterval(() => {
+    if (!stopped) {
+      seconds++;
+      onProgress(type, 0, 'active', messageBuilder(seconds));
+    }
+  }, intervalMs);
+
+  return {
+    stop: () => {
+      if (!stopped) {
+        stopped = true;
+        clearInterval(interval);
+      }
+    },
+    isStopped: () => stopped,
+  };
+}
+
+/**
  * Download audio chunk using yt-dlp
  * @param {string} url - Video URL
  * @param {string} outputPath - Output file path
@@ -23,12 +54,12 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
   const sectionSpec = `*${formatTime(startTime)}-${formatTime(endTime)}`;
   const targetDuration = formatTime(duration);
 
-  // Heartbeat during initial connection (before yt-dlp starts reporting progress)
-  let waitSeconds = 0;
-  const heartbeat = setInterval(() => {
-    waitSeconds++;
-    onProgress('audio', 0, 'active', `Connecting... (${waitSeconds}s)`);
-  }, 1000);
+  // Heartbeat during initial connection
+  const heartbeat = createHeartbeat(
+    onProgress,
+    'audio',
+    (s) => `Connecting... (${s}s)`
+  );
 
   onProgress('audio', 0, 'active', `Connecting...`);
 
@@ -46,17 +77,13 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
     ]);
 
     let lastProgress = 0;
-    let heartbeatCleared = false;
 
     ytdlpProc.stderr.on('data', (data) => {
       const line = data.toString();
       const timeMatch = line.match(/time=(\d+):(\d+):(\d+)/);
       if (timeMatch) {
-        // Clear heartbeat on first real progress
-        if (!heartbeatCleared) {
-          clearInterval(heartbeat);
-          heartbeatCleared = true;
-        }
+        // Stop heartbeat on first real progress
+        heartbeat.stop();
         const hours = parseInt(timeMatch[1]);
         const mins = parseInt(timeMatch[2]);
         const secs = parseInt(timeMatch[3]);
@@ -71,13 +98,13 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
     });
 
     ytdlpProc.on('close', (code) => {
-      clearInterval(heartbeat);
+      heartbeat.stop();
       if (code === 0) resolve();
       else reject(new Error(`yt-dlp exited with code ${code}`));
     });
 
     ytdlpProc.on('error', (err) => {
-      clearInterval(heartbeat);
+      heartbeat.stop();
       reject(err);
     });
   });
@@ -112,17 +139,16 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
   const { onProgress = () => {}, partNum = 1 } = options;
   const sectionSpec = `*${formatTime(startTime)}-${formatTime(endTime)}`;
 
-  // Heartbeat during initial connection (before download starts)
-  let waitSeconds = 0;
-  const heartbeat = setInterval(() => {
-    waitSeconds++;
-    onProgress('video', 0, 'active', `Downloading Part ${partNum}... connecting (${waitSeconds}s)`);
-  }, 1000);
+  // Heartbeat during initial connection
+  const heartbeat = createHeartbeat(
+    onProgress,
+    'video',
+    (s) => `Downloading Part ${partNum}... connecting (${s}s)`
+  );
 
   onProgress('video', 0, 'active', `Downloading Part ${partNum}... connecting`);
 
   let lastVideoSize = 0;
-  let heartbeatCleared = false;
   const videoMonitor = setInterval(() => {
     try {
       const partPath = outputPath + '.part';
@@ -130,10 +156,9 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
       if (checkPath) {
         const stats = fs.statSync(checkPath);
         const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
-        // Clear heartbeat once download actually starts
-        if (!heartbeatCleared && stats.size > 0) {
-          clearInterval(heartbeat);
-          heartbeatCleared = true;
+        // Stop heartbeat once download actually starts
+        if (stats.size > 0) {
+          heartbeat.stop();
         }
         if (stats.size !== lastVideoSize) {
           lastVideoSize = stats.size;
@@ -154,7 +179,7 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
       forceKeyframesAtCuts: true,
     });
   } finally {
-    clearInterval(heartbeat);
+    heartbeat.stop();
     clearInterval(videoMonitor);
   }
 
