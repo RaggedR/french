@@ -1,5 +1,6 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import type { Translation } from '../types';
+import { apiRequest } from '../services/api';
 
 interface WordPopupProps {
   translation: Translation | null;
@@ -7,6 +8,9 @@ interface WordPopupProps {
   error: string | null;
   position: { x: number; y: number } | null;
   onClose: () => void;
+  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string) => void;
+  isInDeck?: boolean;
+  context?: string;
 }
 
 function speak(text: string, language: string) {
@@ -31,12 +35,40 @@ export function WordPopup({
   error,
   position,
   onClose,
+  onAddToDeck,
+  isInDeck,
+  context,
 }: WordPopupProps) {
+  const [isAddingToDeck, setIsAddingToDeck] = useState(false);
+
   const handleSpeak = useCallback(() => {
     if (translation) {
       speak(translation.word, translation.sourceLanguage);
     }
   }, [translation]);
+
+  const handleAddToDeck = useCallback(async () => {
+    if (!translation || !onAddToDeck) return;
+    setIsAddingToDeck(true);
+    try {
+      // Translate the context sentence if we have one
+      let contextTranslation: string | undefined;
+      if (context) {
+        const data = await apiRequest<Translation>('/api/translate', {
+          method: 'POST',
+          body: JSON.stringify({ word: context }),
+        });
+        contextTranslation = data.translation;
+      }
+      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, context, contextTranslation);
+    } catch {
+      // Still add without sentence translation if it fails
+      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, context);
+    } finally {
+      setIsAddingToDeck(false);
+    }
+  }, [translation, onAddToDeck, context]);
+
   if (!position) return null;
 
   // Don't show popup if nothing to display yet
@@ -115,6 +147,41 @@ export function WordPopup({
               </button>
             </div>
             <div className="mt-1 text-gray-600">{translation.translation}</div>
+            {onAddToDeck && (
+              <div className="mt-2 pt-2 border-t border-gray-100">
+                {isInDeck ? (
+                  <span className="inline-flex items-center gap-1 text-xs text-green-600">
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                    </svg>
+                    In deck
+                  </span>
+                ) : (
+                  <button
+                    onClick={handleAddToDeck}
+                    disabled={isAddingToDeck}
+                    className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 transition-colors disabled:opacity-50"
+                  >
+                    {isAddingToDeck ? (
+                      <>
+                        <svg className="animate-spin w-3.5 h-3.5" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                        Adding...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                        </svg>
+                        Add to deck
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>

@@ -8,8 +8,8 @@ import ytdlpBase from 'yt-dlp-exec';
 import dotenv from 'dotenv';
 import { Storage } from '@google-cloud/storage';
 import { spawn } from 'child_process';
-import { createChunks, getChunkTranscript, formatTime } from './chunking.js';
-import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, getOkRuVideoInfo } from './media.js';
+import { createChunks, createTextChunks, getChunkTranscript, formatTime } from './chunking.js';
+import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps } from './media.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -140,6 +140,7 @@ function normalizeUrl(url) {
   if (videoId) return `ok.ru/video/${videoId}`;
   try {
     const u = new URL(url);
+    // For lib.ru, normalize to hostname + path
     return u.hostname + u.pathname;
   } catch {
     return url;
@@ -289,6 +290,9 @@ async function getAnalysisSession(sessionId) {
     } else if (!session.chunkTranscripts) {
       session.chunkTranscripts = new Map();
     }
+    if (session.chunkTexts && Array.isArray(session.chunkTexts)) {
+      session.chunkTexts = new Map(session.chunkTexts);
+    }
     // Cache in memory for faster access
     analysisSessions.set(sessionId, session);
     console.log(`[Session] Restored session ${sessionId} from GCS`);
@@ -309,6 +313,9 @@ async function setAnalysisSession(sessionId, session) {
     chunkTranscripts: session.chunkTranscripts instanceof Map
       ? Array.from(session.chunkTranscripts.entries())
       : session.chunkTranscripts,
+    chunkTexts: session.chunkTexts instanceof Map
+      ? Array.from(session.chunkTexts.entries())
+      : session.chunkTexts,
   };
   await saveSession(sessionId, sessionToSave);
 }
@@ -357,6 +364,37 @@ async function cleanupOldSessions() {
     console.log(`[Cleanup] Complete. Deleted ${deletedCount} old sessions.`);
   } catch (err) {
     console.error('[Cleanup] Error during cleanup:', err.message);
+  }
+}
+
+/**
+ * Rebuild the in-memory URL → sessionId cache from GCS sessions.
+ * Called on startup so that cached sessions survive cold starts and deploys.
+ */
+async function rebuildUrlCache() {
+  if (IS_LOCAL || !bucket) return;
+
+  try {
+    const [sessionFiles] = await bucket.getFiles({ prefix: 'sessions/' });
+    let cached = 0;
+
+    for (const file of sessionFiles) {
+      try {
+        const [contents] = await file.download();
+        const session = JSON.parse(contents.toString());
+        if (session.status === 'ready' && session.url) {
+          const sessionId = file.name.replace('sessions/', '').replace('.json', '');
+          cacheSessionUrl(session.url, sessionId);
+          cached++;
+        }
+      } catch {
+        // Skip unreadable sessions
+      }
+    }
+
+    console.log(`[Startup] Rebuilt URL cache: ${cached} sessions`);
+  } catch (err) {
+    console.error('[Startup] Failed to rebuild URL cache:', err.message);
   }
 }
 
@@ -692,6 +730,48 @@ app.get('/api/local-video/:filename', (req, res) => {
 });
 
 /**
+ * GET /api/local-audio/:filename
+ * Serve locally stored TTS audio files (development only)
+ */
+app.get('/api/local-audio/:filename', (req, res) => {
+  if (!IS_LOCAL) {
+    return res.status(404).json({ error: 'Not available in production' });
+  }
+
+  const key = req.params.filename.replace('.mp3', '');
+  const audioPath = localSessions.get(`audio_${key}`);
+
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    return res.status(404).json({ error: 'Audio not found' });
+  }
+
+  const stat = fs.statSync(audioPath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = end - start + 1;
+    const file = fs.createReadStream(audioPath, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'audio/mpeg',
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'audio/mpeg',
+    });
+    fs.createReadStream(audioPath).pipe(res);
+  }
+});
+
+/**
  * GET /api/hls/:sessionId/playlist.m3u8
  * Proxy and rewrite HLS manifest
  */
@@ -913,6 +993,7 @@ app.post('/api/analyze', async (req, res) => {
       sessionId: cached.sessionId,
       status: 'cached',
       title: cached.session.title,
+      contentType: cached.session.contentType || 'video',
       totalDuration: cached.session.totalDuration,
       chunks: cached.session.chunks,
       hasMoreChunks: cached.session.hasMoreChunks,
@@ -940,6 +1021,59 @@ app.post('/api/analyze', async (req, res) => {
     try {
       console.log(`[Analyze] Session ${sessionId}: Starting analysis`);
 
+      // ── Text mode (lib.ru) ──
+      if (isLibRuUrl(url)) {
+        sendProgress(sessionId, 'audio', 10, 'active', 'Fetching text from lib.ru...');
+
+        const { title, author, text } = await fetchLibRuText(url);
+        const displayTitle = author ? `${author} — ${title}` : title;
+
+        sendProgress(sessionId, 'audio', 50, 'active', 'Chunking text...');
+        const textChunks = createTextChunks(text);
+        console.log(`[Analyze] Session ${sessionId}: Text mode - "${displayTitle}" (${text.length} chars, ${textChunks.length} chunks)`);
+
+        // Build chunk texts map for TTS generation later
+        const chunkTexts = new Map();
+        const chunks = textChunks.map(chunk => {
+          chunkTexts.set(chunk.id, chunk.text);
+          return {
+            id: chunk.id,
+            index: chunk.index,
+            startTime: 0,
+            endTime: 0,
+            duration: 0,
+            previewText: chunk.previewText,
+            wordCount: chunk.wordCount,
+            status: 'pending',
+            videoUrl: null,
+          };
+        });
+
+        await setAnalysisSession(sessionId, {
+          status: 'ready',
+          url,
+          title: displayTitle,
+          contentType: 'text',
+          chunks,
+          chunkTexts,
+          totalDuration: 0,
+          hasMoreChunks: false,
+          chunkTranscripts: new Map(),
+        });
+
+        cacheSessionUrl(url, sessionId);
+
+        sendProgress(sessionId, 'complete', 100, 'complete', 'Text ready', {
+          title: displayTitle,
+          totalDuration: 0,
+          chunks,
+          hasMoreChunks: false,
+          contentType: 'text',
+        });
+        return;
+      }
+
+      // ── Video mode (ok.ru) ──
       // Fast info fetch via HTML scraping (~4-5s vs yt-dlp's ~15s)
       sendProgress(sessionId, 'audio', 1, 'active', 'Fetching video info...');
 
@@ -1012,7 +1146,10 @@ app.post('/api/analyze', async (req, res) => {
       const rawTranscript = await transcribeAudioChunk(audioPath, { onProgress });
 
       // Add punctuation via LLM
-      const fullBatchTranscript = await addPunctuation(rawTranscript, { onProgress });
+      const punctuatedTranscript = await addPunctuation(rawTranscript, { onProgress });
+
+      // Lemmatize words for frequency matching
+      const fullBatchTranscript = await lemmatizeWords(punctuatedTranscript, { onProgress });
 
       // Clean up audio file
       fs.unlinkSync(audioPath);
@@ -1051,6 +1188,7 @@ app.post('/api/analyze', async (req, res) => {
         status: 'ready',
         url,
         title,
+        contentType: 'video',
         transcript,
         chunks,
         totalDuration,
@@ -1144,7 +1282,10 @@ app.post('/api/load-more-chunks', async (req, res) => {
     const rawTranscriptUnpunctuated = await transcribeAudioChunk(audioPath, { onProgress });
 
     // Add punctuation via LLM
-    const rawTranscript = await addPunctuation(rawTranscriptUnpunctuated, { onProgress });
+    const punctuatedTranscript = await addPunctuation(rawTranscriptUnpunctuated, { onProgress });
+
+    // Lemmatize words for frequency matching
+    const rawTranscript = await lemmatizeWords(punctuatedTranscript, { onProgress });
 
     // Clean up audio
     fs.unlinkSync(audioPath);
@@ -1302,6 +1443,8 @@ const TYPE_STYLES = {
   audio:         { color: TERM_COLORS.blue,    label: 'AUDIO' },
   transcription: { color: TERM_COLORS.green,   label: 'TRANSCRIBE' },
   punctuation:   { color: TERM_COLORS.yellow,  label: 'PUNCTUATE' },
+  lemmatization: { color: TERM_COLORS.yellow,  label: 'LEMMATIZE' },
+  tts:           { color: TERM_COLORS.cyan,    label: 'TTS' },
   video:         { color: TERM_COLORS.magenta,  label: 'VIDEO' },
   complete:      { color: TERM_COLORS.green,   label: 'DONE' },
   error:         { color: TERM_COLORS.red,     label: 'ERROR' },
@@ -1376,6 +1519,7 @@ app.get('/api/session/:sessionId', async (req, res) => {
     res.json({
       status: 'ready',
       title: session.title,
+      contentType: session.contentType || 'video',
       totalDuration: session.totalDuration,
       originalUrl: session.url,
       hasMoreChunks: session.hasMoreChunks || false,
@@ -1389,6 +1533,7 @@ app.get('/api/session/:sessionId', async (req, res) => {
         wordCount: chunk.wordCount,
         status: chunk.status,
         videoUrl: chunk.videoUrl,
+        audioUrl: chunk.audioUrl,
       })),
     });
   } else if (session.status === 'error') {
@@ -1435,11 +1580,16 @@ app.get('/api/session/:sessionId/chunk/:chunkId', async (req, res) => {
   }
 
   const partNum = parseInt(chunkId.split('-')[1]) + 1;
-  res.json({
-    videoUrl: chunk.videoUrl,
+  const response = {
     transcript,
     title: `${session.title} - Part ${partNum}`,
-  });
+  };
+  if (session.contentType === 'text') {
+    response.audioUrl = chunk.audioUrl;
+  } else {
+    response.videoUrl = chunk.videoUrl;
+  }
+  res.json(response);
 });
 
 /**
@@ -1501,6 +1651,80 @@ app.post('/api/download-chunk', async (req, res) => {
     }
   }
 
+  // ── Text mode: TTS + Whisper pipeline ──
+  if (session.contentType === 'text') {
+    chunk.status = 'downloading';
+    const tempDir = path.join(__dirname, 'temp');
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+    const audioPath = path.join(tempDir, `tts_${sessionId}_${chunkId}.mp3`);
+
+    try {
+      const chunkText = session.chunkTexts instanceof Map
+        ? session.chunkTexts.get(chunkId)
+        : null;
+      if (!chunkText) {
+        throw new Error('Chunk text not found');
+      }
+
+      const partNum = parseInt(chunkId.split('-')[1]) + 1;
+      const onProgress = createProgressCallback(sessionId);
+      console.log(`[Download-Chunk] Text mode: Session ${sessionId}, Chunk ${chunkId} (${chunkText.length} chars)`);
+
+      // Step 1: Generate TTS audio
+      await generateTtsAudio(chunkText, audioPath, { onProgress });
+
+      // Step 2: Get audio duration and estimate word timestamps proportionally
+      const duration = await getAudioDuration(audioPath);
+      const rawChunkTranscript = estimateWordTimestamps(chunkText, duration);
+
+      // Lemmatize words for frequency matching
+      const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress });
+
+      // Serve audio locally or upload to GCS
+      let audioUrl;
+      if (!IS_LOCAL && bucket) {
+        const gcsFileName = `videos/${sessionId}_${chunkId}.mp3`;
+        await bucket.upload(audioPath, {
+          destination: gcsFileName,
+          metadata: { contentType: 'audio/mpeg', cacheControl: 'public, max-age=86400' },
+        });
+        await bucket.file(gcsFileName).makePublic();
+        audioUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+        if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+      } else {
+        audioUrl = `/api/local-audio/${sessionId}_${chunkId}.mp3`;
+        localSessions.set(`audio_${sessionId}_${chunkId}`, audioPath);
+      }
+
+      chunk.status = 'ready';
+      chunk.audioUrl = audioUrl;
+      session.chunkTranscripts.set(chunkId, chunkTranscript);
+      await setAnalysisSession(sessionId, session);
+
+      sendProgress(sessionId, 'tts', 100, 'complete', 'Ready');
+      console.log(`[Download-Chunk] Text mode: Chunk ${chunkId} ready at ${audioUrl}`);
+
+      res.json({
+        audioUrl,
+        transcript: chunkTranscript,
+        title: `${session.title} - Part ${partNum}`,
+      });
+
+      // Prefetch next chunk
+      const currentIndex = parseInt(chunkId.split('-')[1]);
+      prefetchNextChunk(sessionId, currentIndex).catch(() => {});
+      return;
+
+    } catch (error) {
+      console.error(`[Download-Chunk] Text mode error:`, error);
+      chunk.status = 'pending';
+      if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+      sendProgress(sessionId, 'tts', 0, 'error', error.message);
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  // ── Video mode ──
   // Get startTime/endTime from the chunk (not from request body)
   const { startTime, endTime } = chunk;
 
@@ -1623,11 +1847,51 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
     console.log(`[Prefetch] Starting prefetch of ${nextChunk.id} for session ${sessionId}`);
 
     const tempDir = path.join(__dirname, 'temp');
+    nextChunk.status = 'downloading';
+
+    // ── Text mode prefetch ──
+    if (session.contentType === 'text') {
+      const audioPath = path.join(tempDir, `tts_${sessionId}_${nextChunk.id}.mp3`);
+      const chunkText = session.chunkTexts instanceof Map
+        ? session.chunkTexts.get(nextChunk.id)
+        : null;
+      if (!chunkText) {
+        nextChunk.status = 'pending';
+        return;
+      }
+
+      const silentProgress = () => {};
+      await generateTtsAudio(chunkText, audioPath, { onProgress: silentProgress });
+      const duration = await getAudioDuration(audioPath);
+      const rawChunkTranscript = estimateWordTimestamps(chunkText, duration);
+      const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress: silentProgress });
+
+      let audioUrl;
+      if (!IS_LOCAL && bucket) {
+        const gcsFileName = `videos/${sessionId}_${nextChunk.id}.mp3`;
+        await bucket.upload(audioPath, {
+          destination: gcsFileName,
+          metadata: { contentType: 'audio/mpeg', cacheControl: 'public, max-age=86400' },
+        });
+        await bucket.file(gcsFileName).makePublic();
+        audioUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+        if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+      } else {
+        audioUrl = `/api/local-audio/${sessionId}_${nextChunk.id}.mp3`;
+        localSessions.set(`audio_${sessionId}_${nextChunk.id}`, audioPath);
+      }
+
+      nextChunk.status = 'ready';
+      nextChunk.audioUrl = audioUrl;
+      session.chunkTranscripts.set(nextChunk.id, chunkTranscript);
+      await setAnalysisSession(sessionId, session);
+      console.log(`[Prefetch] Completed text chunk ${nextChunk.id}`);
+      return;
+    }
+
+    // ── Video mode prefetch ──
     const chunkPath = path.join(tempDir, `chunk_${sessionId}_${nextChunk.id}.mp4`);
     const { startTime, endTime } = nextChunk;
-
-    // Mark as downloading
-    nextChunk.status = 'downloading';
 
     // Check for cached extraction info
     let cachedInfoPath = null;
@@ -1699,10 +1963,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'loaded from .env' : 'not set'}`);
     console.log(`Google API key: ${process.env.GOOGLE_TRANSLATE_API_KEY ? 'loaded from .env' : 'not set'}`);
 
-    // Run cleanup on startup (non-blocking)
-    cleanupOldSessions().catch(err => {
-      console.error('[Startup] Cleanup failed:', err.message);
-    });
+    // Run cleanup then rebuild URL cache on startup (non-blocking)
+    cleanupOldSessions()
+      .then(() => rebuildUrlCache())
+      .catch(err => {
+        console.error('[Startup] Cleanup/cache rebuild failed:', err.message);
+      });
   });
 }
 

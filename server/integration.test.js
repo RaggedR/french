@@ -21,11 +21,28 @@ vi.mock('./media.js', () => {
     downloadVideoChunk: vi.fn(),
     transcribeAudioChunk: vi.fn(),
     addPunctuation: vi.fn(),
+    lemmatizeWords: vi.fn(),
     createHeartbeat: vi.fn(() => ({
       stop: () => {},
       isStopped: () => true,
       getSeconds: () => 0,
     })),
+    // Text mode (lib.ru) functions
+    isLibRuUrl: vi.fn(() => false),
+    fetchLibRuText: vi.fn(),
+    generateTtsAudio: vi.fn(),
+    getAudioDuration: vi.fn(() => 30),
+    estimateWordTimestamps: vi.fn((text, duration) => ({
+      words: text.split(/\s+/).map((w, i) => ({ word: (i > 0 ? ' ' : '') + w, start: i, end: i + 1 })),
+      segments: [{ text, start: 0, end: duration }],
+      language: 'ru',
+      duration,
+    })),
+    alignWhisperToOriginal: vi.fn(() => []),
+    // String utility functions used by index.js
+    stripPunctuation: vi.fn((w) => w),
+    editDistance: vi.fn(() => 0),
+    isFuzzyMatch: vi.fn(() => false),
   };
 });
 
@@ -36,6 +53,7 @@ import {
   downloadVideoChunk,
   transcribeAudioChunk,
   addPunctuation,
+  lemmatizeWords,
 } from './media.js';
 
 // Import server after mocks are set up
@@ -212,6 +230,7 @@ function setupHappyPathMocks(duration = 900) {
   transcribeAudioChunk.mockResolvedValue(transcript);
 
   addPunctuation.mockImplementation(async (t) => t);
+  lemmatizeWords.mockImplementation(async (t) => t);
 
   downloadVideoChunk.mockImplementation(async (url, outputPath) => {
     fs.writeFileSync(outputPath, 'fake-video-data');
@@ -621,6 +640,7 @@ describe('G. POST /api/load-more-chunks', () => {
     });
     transcribeAudioChunk.mockResolvedValue(longTranscript);
     addPunctuation.mockImplementation(async (t) => t);
+    lemmatizeWords.mockImplementation(async (t) => t);
     downloadVideoChunk.mockImplementation(async (url, outputPath) => {
       fs.writeFileSync(outputPath, 'fake-video');
       return { size: 100000 };
@@ -675,6 +695,7 @@ describe('G. POST /api/load-more-chunks', () => {
     });
     transcribeAudioChunk.mockResolvedValue(shortTranscript);
     addPunctuation.mockImplementation(async (t) => t);
+    lemmatizeWords.mockImplementation(async (t) => t);
 
     const { sessionId } = await analyzeAndWait('https://ok.ru/video/short-' + Date.now());
     const session = analysisSessions.get(sessionId);

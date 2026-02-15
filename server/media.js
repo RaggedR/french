@@ -3,12 +3,19 @@ import { spawn } from 'child_process';
 import OpenAI from 'openai';
 import ytdlpBase from 'yt-dlp-exec';
 import { formatTime } from './chunking.js';
+import { pipeline } from 'stream/promises';
+import http from 'http';
+import https from 'https';
 
 // Use system yt-dlp binary instead of bundled one
 const ytdlp = ytdlpBase.create('yt-dlp');
 
 // ok.ru extraction typically takes 90-120 seconds due to their anti-bot JS protection
 const ESTIMATED_EXTRACTION_TIME = 100; // seconds
+
+// Process-level timeout: kills yt-dlp if it hangs (ok.ru CDN can be unreachable)
+// 240s leaves a 60s buffer before Cloud Run's 300s request timeout
+const YTDLP_TIMEOUT_MS = 240_000;
 
 /**
  * Fast info fetch for ok.ru videos by scraping OG meta tags (~4-5s vs yt-dlp's ~15s)
@@ -148,6 +155,18 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
 
   await new Promise((resolve, reject) => {
     const ytdlpProc = spawn('yt-dlp', args);
+    let settled = false;
+
+    // Kill yt-dlp if it hangs (ok.ru CDN can become unreachable)
+    const processTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        heartbeat.stop();
+        clearInterval(audioMonitor);
+        ytdlpProc.kill('SIGTERM');
+        reject(new Error(`Audio download timed out after ${YTDLP_TIMEOUT_MS / 1000}s — ok.ru may be unreachable. Try again later.`));
+      }
+    }, YTDLP_TIMEOUT_MS);
 
     let lastProgress = 0;
     let lastAudioSize = 0;
@@ -245,6 +264,9 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
     });
 
     ytdlpProc.on('close', (code) => {
+      clearTimeout(processTimer);
+      if (settled) return;
+      settled = true;
       heartbeat.stop();
       clearInterval(audioMonitor);
       if (code === 0) resolve();
@@ -252,6 +274,9 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
     });
 
     ytdlpProc.on('error', (err) => {
+      clearTimeout(processTimer);
+      if (settled) return;
+      settled = true;
       heartbeat.stop();
       clearInterval(audioMonitor);
       reject(err);
@@ -372,9 +397,22 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
     // Using cached extraction - progress will show in sendProgress
   }
 
+  // Launch yt-dlp with a process-level timeout
+  const ytdlpProcess = ytdlp(url, ytdlpOptions);
+  const processTimer = setTimeout(() => {
+    if (ytdlpProcess.kill) ytdlpProcess.kill('SIGTERM');
+  }, YTDLP_TIMEOUT_MS);
+
   try {
-    await ytdlp(url, ytdlpOptions);
+    await ytdlpProcess;
+  } catch (err) {
+    // Provide a clear message if killed by our timeout
+    if (err.killed || err.signal === 'SIGTERM') {
+      throw new Error(`Video download timed out after ${YTDLP_TIMEOUT_MS / 1000}s — ok.ru may be unreachable. Try again later.`);
+    }
+    throw err;
   } finally {
+    clearTimeout(processTimer);
     heartbeat.stop();
     clearInterval(videoMonitor);
   }
@@ -690,4 +728,502 @@ Rules:
     words: punctuatedWords,
     segments: punctuatedSegments,
   };
+}
+
+/**
+ * Lemmatize transcript words using GPT-4o.
+ * Extracts unique words, sends them in batches to GPT-4o for lemmatization,
+ * and attaches a `lemma` field to each WordTimestamp.
+ *
+ * @param {Object} transcript - Transcript { words, segments, language, duration }
+ * @param {Object} options
+ * @param {string} options.apiKey - OpenAI API key
+ * @param {function} options.onProgress - Progress callback
+ * @returns {Promise<Object>} - Transcript with lemma fields on words
+ */
+export async function lemmatizeWords(transcript, options = {}) {
+  const {
+    apiKey = process.env.OPENAI_API_KEY,
+    onProgress = () => {},
+  } = options;
+
+  if (!apiKey || !transcript.words || transcript.words.length === 0) {
+    return transcript;
+  }
+
+  const startTime = Date.now();
+
+  // Extract unique normalized words
+  const wordSet = new Set();
+  for (const w of transcript.words) {
+    const normalized = stripPunctuation(w.word).toLowerCase();
+    if (normalized) wordSet.add(normalized);
+  }
+
+  const uniqueWords = Array.from(wordSet);
+  console.log(`[Lemmatize] ${uniqueWords.length} unique words from ${transcript.words.length} total`);
+  onProgress('lemmatization', 0, 'active', `Lemmatizing ${uniqueWords.length} unique words...`);
+
+  const openai = new OpenAI({ apiKey });
+  const BATCH_SIZE = 300;
+  const lemmaMap = new Map();
+
+  for (let i = 0; i < uniqueWords.length; i += BATCH_SIZE) {
+    const batch = uniqueWords.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(uniqueWords.length / BATCH_SIZE);
+    const percent = Math.round((i / uniqueWords.length) * 90);
+    onProgress('lemmatization', percent, 'active',
+      `Lemmatizing... (batch ${batchNum}/${totalBatches})`);
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        temperature: 0,
+        messages: [
+          {
+            role: 'system',
+            content: `You are a Russian morphology tool. For each word, return its dictionary lemma (nominative singular for nouns/adjectives, masculine nominative singular for adjectives/participles, infinitive for verbs). Return ONLY a JSON object mapping each input word to its lemma. No explanation.`,
+          },
+          {
+            role: 'user',
+            content: JSON.stringify(batch),
+          },
+        ],
+      });
+
+      const content = response.choices[0].message.content.trim();
+      // Strip markdown code fences if present
+      const jsonStr = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+      const parsed = JSON.parse(jsonStr);
+
+      for (const [word, lemma] of Object.entries(parsed)) {
+        if (typeof lemma === 'string' && lemma.length > 0) {
+          lemmaMap.set(word.toLowerCase(), lemma.toLowerCase());
+        }
+      }
+
+      console.log(`[Lemmatize] Batch ${batchNum}: got ${Object.keys(parsed).length} lemmas`);
+    } catch (err) {
+      console.error(`[Lemmatize] Error in batch ${batchNum}:`, err.message);
+      // Skip this batch — words will just have no lemma
+    }
+  }
+
+  // Attach lemma to each word
+  const lemmatizedWords = transcript.words.map(w => {
+    const normalized = stripPunctuation(w.word).toLowerCase();
+    const lemma = lemmaMap.get(normalized);
+    return lemma ? { ...w, lemma } : w;
+  });
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  const coverage = lemmatizedWords.filter(w => w.lemma).length;
+  console.log(`[Lemmatize] Complete in ${elapsed}s: ${coverage}/${transcript.words.length} words lemmatized`);
+  onProgress('lemmatization', 100, 'complete', `Lemmatized in ${elapsed}s`);
+
+  return {
+    ...transcript,
+    words: lemmatizedWords,
+  };
+}
+
+/**
+ * Check if a URL is a lib.ru text URL
+ * @param {string} url
+ * @returns {boolean}
+ */
+export function isLibRuUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname === 'lib.ru' || u.hostname.endsWith('.lib.ru');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fetch and extract Russian text from a lib.ru page.
+ * lib.ru pages have varying encodings (KOI8-R, windows-1251) and messy HTML.
+ * We strip tags, then use GPT-4o to identify where the literary prose begins.
+ * @param {string} url - lib.ru URL
+ * @param {object} options
+ * @param {string} options.apiKey - OpenAI API key
+ * @returns {Promise<{title: string, author: string, text: string}>}
+ */
+export async function fetchLibRuText(url, options = {}) {
+  const { apiKey = process.env.OPENAI_API_KEY } = options;
+
+  // Use http/https.get with insecureHTTPParser because lib.ru sends malformed
+  // HTTP chunked encoding that Node's strict parser rejects (HPE_INVALID_CHUNK_SIZE).
+  // lib.ru serves over plain HTTP, so we pick the right module based on protocol.
+  const httpModule = url.startsWith('https') ? https : http;
+  const { status, buffer, contentType } = await new Promise((resolve, reject) => {
+    httpModule.get(url, {
+      insecureHTTPParser: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        buffer: Buffer.concat(chunks),
+        contentType: res.headers['content-type'] || '',
+      }));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+
+  if (status !== 200) {
+    throw new Error(`Failed to fetch lib.ru page: ${status}`);
+  }
+
+  // Detect encoding: prefer Content-Type charset header, fall back to heuristic.
+  // Both KOI8-R and windows-1251 map bytes to Cyrillic Unicode, so counting
+  // Cyrillic chars can't distinguish them — we must use the declared charset.
+  const charsetMatch = contentType.match(/charset=([^\s;]+)/i);
+  const declaredCharset = charsetMatch ? charsetMatch[1].toLowerCase() : null;
+
+  let html;
+  if (declaredCharset && (declaredCharset.includes('koi8') || declaredCharset.includes('1251'))) {
+    html = new TextDecoder(declaredCharset).decode(buffer);
+  } else {
+    // No charset declared — try both and pick the one with more lowercase Cyrillic
+    // (real Russian text has mostly lowercase; wrong encoding produces mostly uppercase)
+    const koi8 = new TextDecoder('koi8-r').decode(buffer);
+    const win1251 = new TextDecoder('windows-1251').decode(buffer);
+    const countLower = (s) => (s.slice(0, 2000).match(/[а-я]/g) || []).length;
+    html = countLower(koi8) >= countLower(win1251) ? koi8 : win1251;
+  }
+
+  // Extract title from <title> tag
+  let title = 'Untitled';
+  const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+  if (titleMatch) {
+    title = titleMatch[1].trim();
+  }
+
+  // Strip all HTML tags to get raw text
+  let rawText = html
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&copy;/g, '(c)')
+    .trim();
+
+  // Use GPT-4o to find where the literary prose begins.
+  // We send the first ~200 numbered lines and ask for just the line number.
+  // This handles the wide variety of lib.ru page layouts (metadata, ratings,
+  // chapter headings, OCR credits, etc.) without brittle heuristics.
+  const lines = rawText.split('\n');
+  const headerLines = lines.slice(0, 200);
+  const numberedHeader = headerLines.map((l, i) => `${i}: ${l}`).join('\n');
+
+  try {
+    const openai = new OpenAI({ apiKey });
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      max_tokens: 20,
+      messages: [{
+        role: 'user',
+        content: `Below are the first 200 numbered lines of a Russian literary text from lib.ru, after HTML tags were stripped. The page starts with metadata (title, author, navigation, ratings, OCR credits, publisher info, dashed separators) followed by the actual literary prose (novel, story, poem, etc).
+
+Reply with ONLY the line number where the actual literary prose begins. Not chapter headings, not epigraphs — the first sentence of narrative text. Just the number, nothing else.
+
+${numberedHeader}`
+      }],
+    });
+
+    const lineNum = parseInt(response.choices[0].message.content.trim(), 10);
+    if (!isNaN(lineNum) && lineNum > 0 && lineNum < lines.length) {
+      rawText = lines.slice(lineNum).join('\n').trim();
+      console.log(`[LibRu] GPT-4o-mini: content starts at line ${lineNum}: "${rawText.slice(0, 80)}..."`);
+    } else {
+      console.log(`[LibRu] GPT-4o-mini returned invalid line number: ${response.choices[0].message.content}, using full text`);
+    }
+  } catch (err) {
+    console.error(`[LibRu] GPT-4o-mini content extraction failed, using full text:`, err.message);
+  }
+
+  // Strip common lib.ru title prefixes like "Lib.ru/Классика: " or "Lib.ru: "
+  title = title.replace(/^Lib\.ru\/[^:]*:\s*/i, '').replace(/^Lib\.ru:\s*/i, '').trim();
+
+  // Extract author from title (lib.ru titles are often "Author. Title" or "Author Full Name. Title")
+  // Match author: sequence of capitalized words ending with a period, before the title
+  let author = '';
+  const authorMatch = title.match(/^([А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z]+)*)\.\s+/);
+  if (authorMatch) {
+    author = authorMatch[1].trim();
+    title = title.slice(authorMatch[0].length).trim();
+  }
+
+  if (!rawText || rawText.length < 50) {
+    throw new Error('Extracted text is too short — page may not contain readable content');
+  }
+
+  console.log(`[LibRu] Fetched "${title}" by ${author || 'unknown'} (${rawText.length} chars)`);
+  return { title, author, text: rawText };
+}
+
+/**
+ * Generate TTS audio from text using OpenAI TTS API.
+ * @param {string} text - Text to convert to speech
+ * @param {string} outputPath - Output file path (MP3)
+ * @param {object} options
+ * @param {string} options.apiKey - OpenAI API key
+ * @param {function} options.onProgress - Progress callback
+ * @returns {Promise<{size: number}>}
+ */
+export async function generateTtsAudio(text, outputPath, options = {}) {
+  const {
+    apiKey = process.env.OPENAI_API_KEY,
+    onProgress = () => {},
+  } = options;
+
+  if (!apiKey) {
+    throw new Error('OpenAI API key is required');
+  }
+
+  // Estimate TTS time: ~1s per 200 chars (empirical), minimum 3s
+  const estimatedSeconds = Math.max(3, Math.round(text.length / 200));
+  console.log(`[TTS] Generating speech for ${text.length} chars (est. ${estimatedSeconds}s)...`);
+
+  const heartbeat = createHeartbeat(
+    onProgress,
+    'tts',
+    (ticks) => {
+      const elapsed = ticks / 2; // 500ms ticks
+      const pct = Math.min(95, Math.round((elapsed / estimatedSeconds) * 100));
+      return { percent: pct, message: `Generating speech... ${elapsed.toFixed(0)}s / ~${estimatedSeconds}s` };
+    },
+    500, // tick every 500ms for smooth progress
+  );
+
+  const openai = new OpenAI({ apiKey });
+  const ttsStart = Date.now();
+  try {
+    const response = await openai.audio.speech.create({
+      model: 'tts-1',
+      voice: 'nova',
+      input: text,
+      response_format: 'mp3',
+    });
+
+    // Stream response body to file
+    // OpenAI SDK returns a Node.js PassThrough stream, not a web ReadableStream
+    const fileStream = fs.createWriteStream(outputPath);
+    await pipeline(response.body, fileStream);
+  } finally {
+    heartbeat.stop();
+  }
+
+  const elapsed = ((Date.now() - ttsStart) / 1000).toFixed(1);
+  const stats = fs.statSync(outputPath);
+  const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
+  console.log(`[TTS] Done: ${sizeMB} MB in ${elapsed}s`);
+  onProgress('tts', 100, 'complete', `Speech generated (${sizeMB} MB)`);
+
+  return { size: stats.size };
+}
+
+/**
+ * Get audio duration in seconds using ffprobe.
+ * @param {string} audioPath - Path to audio file
+ * @returns {Promise<number>} Duration in seconds
+ */
+export function getAudioDuration(audioPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'csv=p=0',
+      audioPath,
+    ]);
+    let output = '';
+    proc.stdout.on('data', (data) => { output += data; });
+    proc.on('close', (code) => {
+      if (code !== 0) reject(new Error(`ffprobe exited with code ${code}`));
+      else resolve(parseFloat(output.trim()));
+    });
+    proc.on('error', reject);
+  });
+}
+
+/**
+ * Estimate word-level timestamps by distributing audio duration proportionally
+ * across words based on character length.
+ * @param {string} text - Original text
+ * @param {number} duration - Audio duration in seconds
+ * @returns {{words: Array<{word: string, start: number, end: number}>, segments: Array, duration: number}}
+ */
+export function estimateWordTimestamps(text, duration) {
+  const rawWords = text.split(/\s+/).filter(w => w.length > 0);
+  const totalChars = rawWords.reduce((sum, w) => sum + w.length, 0);
+
+  const words = [];
+  let cursor = 0;
+  for (let i = 0; i < rawWords.length; i++) {
+    const wordDuration = (rawWords[i].length / totalChars) * duration;
+    const start = cursor;
+    const end = cursor + wordDuration;
+    words.push({
+      word: (i > 0 ? ' ' : '') + rawWords[i],
+      start,
+      end,
+    });
+    cursor = end;
+  }
+
+  // Build segments (~20 words each)
+  const segments = [];
+  for (let i = 0; i < words.length; i += 20) {
+    const segWords = words.slice(i, i + 20);
+    segments.push({
+      text: segWords.map(w => w.word).join('').trim(),
+      start: segWords[0].start,
+      end: segWords[segWords.length - 1].end,
+    });
+  }
+
+  return { words, segments, language: 'ru', duration };
+}
+
+/**
+ * Align Whisper-transcribed words back to original text words.
+ * Uses two-pointer fuzzy matching (same approach as addPunctuation).
+ * For matched words: use Whisper timestamps with original word text.
+ * For unmatched: interpolate timestamps from neighbors.
+ *
+ * @param {Array<{word: string, start: number, end: number}>} whisperWords - From Whisper transcription
+ * @param {string[]} originalWords - Original text split into words
+ * @returns {Array<{word: string, start: number, end: number}>}
+ */
+export function alignWhisperToOriginal(whisperWords, originalWords) {
+  if (!whisperWords.length || !originalWords.length) {
+    return originalWords.map((w, i) => ({
+      word: (i > 0 ? ' ' : '') + w,
+      start: 0,
+      end: 0,
+    }));
+  }
+
+  const result = [];
+  let wi = 0; // whisper index
+  let oi = 0; // original index
+
+  while (oi < originalWords.length) {
+    const origWord = originalWords[oi];
+    const origBase = stripPunctuation(origWord).toLowerCase();
+    const leadingSpace = oi > 0 ? ' ' : '';
+
+    if (wi < whisperWords.length) {
+      const whisperBase = stripPunctuation(whisperWords[wi].word).toLowerCase();
+
+      if (origBase === whisperBase || isFuzzyMatch(origBase, whisperBase)) {
+        // Direct match — use original word text with Whisper timing
+        result.push({
+          word: leadingSpace + origWord,
+          start: whisperWords[wi].start,
+          end: whisperWords[wi].end,
+        });
+        wi++;
+        oi++;
+      } else {
+        // Try lookahead in whisper words (TTS may have added/skipped words)
+        let found = false;
+        for (let la = 1; la <= 3 && wi + la < whisperWords.length; la++) {
+          const laBase = stripPunctuation(whisperWords[wi + la].word).toLowerCase();
+          if (laBase === origBase || isFuzzyMatch(laBase, origBase)) {
+            wi += la;
+            result.push({
+              word: leadingSpace + origWord,
+              start: whisperWords[wi].start,
+              end: whisperWords[wi].end,
+            });
+            wi++;
+            oi++;
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          // Try lookahead in original words
+          for (let la = 1; la <= 3 && oi + la < originalWords.length; la++) {
+            const futureBase = stripPunctuation(originalWords[oi + la]).toLowerCase();
+            if (futureBase === whisperBase || isFuzzyMatch(futureBase, whisperBase)) {
+              // Original has extra words — interpolate timestamps
+              for (let skip = 0; skip < la; skip++) {
+                result.push({
+                  word: (oi + skip > 0 ? ' ' : '') + originalWords[oi + skip],
+                  start: -1, // will be interpolated
+                  end: -1,
+                });
+              }
+              oi += la;
+              found = true;
+              break;
+            }
+          }
+        }
+
+        if (!found) {
+          // No match — mark for interpolation
+          result.push({
+            word: leadingSpace + origWord,
+            start: -1,
+            end: -1,
+          });
+          oi++;
+        }
+      }
+    } else {
+      // No more whisper words — mark remaining for interpolation
+      result.push({
+        word: leadingSpace + origWord,
+        start: -1,
+        end: -1,
+      });
+      oi++;
+    }
+  }
+
+  // Interpolate timestamps for unmatched words
+  const totalDuration = whisperWords[whisperWords.length - 1].end;
+  for (let i = 0; i < result.length; i++) {
+    if (result[i].start === -1) {
+      // Find nearest known timestamps before and after
+      let prevEnd = 0;
+      for (let j = i - 1; j >= 0; j--) {
+        if (result[j].end !== -1) {
+          prevEnd = result[j].end;
+          break;
+        }
+      }
+      let nextStart = totalDuration;
+      let gapCount = 1; // count of consecutive unmatched words including this one
+      for (let j = i + 1; j < result.length; j++) {
+        if (result[j].start !== -1) {
+          nextStart = result[j].start;
+          break;
+        }
+        gapCount++;
+      }
+
+      // Distribute the gap evenly
+      const step = (nextStart - prevEnd) / (gapCount + 1);
+      let pos = 0;
+      for (let j = i; j < result.length && result[j].start === -1; j++) {
+        pos++;
+        result[j].start = prevEnd + step * pos;
+        result[j].end = prevEnd + step * (pos + 0.8);
+      }
+    }
+  }
+
+  return result;
 }

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for docs-only changes
+        id: docs-check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD)
+            if echo "$CHANGED" | grep -qvE '\.(md|txt)$|LICENSE'; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.docs-check.outputs.skip != 'true'
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.docs-check.outputs.skip != 'true'
+        run: npm ci && cd server && npm ci
+
+      - name: Build
+        if: steps.docs-check.outputs.skip != 'true'
+        run: npm run build
+
+      - name: Test
+        if: steps.docs-check.outputs.skip != 'true'
+        run: npm test

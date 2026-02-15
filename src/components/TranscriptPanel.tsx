@@ -6,9 +6,11 @@ import { apiRequest } from '../services/api';
 interface TranscriptPanelProps {
   transcript: Transcript;
   currentTime: number;
-  onWordClick: (word: WordTimestamp) => void;
   config: TranslatorConfig;
+  wordFrequencies?: Map<string, number>;
   isLoading?: boolean;
+  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string) => void;
+  isWordInDeck?: (word: string) => boolean;
 }
 
 // Find the current word index based on video time
@@ -46,22 +48,47 @@ function isRussianWord(word: string): boolean {
   return false;
 }
 
+// Strip punctuation, lowercase, and normalize ё→е for frequency lookup.
+// Russian text uses ё and е interchangeably, but frequency corpora
+// typically list the ё-less spelling with a higher rank.
+function normalizeWord(word: string): string {
+  return word.toLowerCase().replace(/[^а-яёА-ЯЁ]/g, '').replace(/ё/g, 'е');
+}
+
 export function TranscriptPanel({
   transcript,
   currentTime,
-  onWordClick,
   config,
+  wordFrequencies,
   isLoading = false,
+  onAddToDeck,
+  isWordInDeck,
 }: TranscriptPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const currentWordRef = useRef<HTMLSpanElement>(null);
   const [selectedWord, setSelectedWord] = useState<WordTimestamp | null>(null);
+  const [selectedContext, setSelectedContext] = useState<string | undefined>(undefined);
   const [popupPosition, setPopupPosition] = useState<{ x: number; y: number } | null>(null);
   const [translation, setTranslation] = useState<Translation | null>(null);
   const [isTranslating, setIsTranslating] = useState(false);
   const [translationError, setTranslationError] = useState<string | null>(null);
 
   const currentWordIndex = findCurrentWordIndex(transcript.words, currentTime);
+
+  const freqMin = config.freqRangeMin;
+  const freqMax = config.freqRangeMax;
+  const hasFreqRange = wordFrequencies && wordFrequencies.size > 0 && freqMin != null && freqMax != null;
+
+
+  const isInFreqRange = useCallback((word: WordTimestamp): boolean => {
+    if (!hasFreqRange) return false;
+    // Normalize ё→е on lemma too, since the corpus uses е-spellings
+    const lookupWord = (word.lemma || normalizeWord(word.word)).replace(/ё/g, 'е');
+    if (!lookupWord) return false;
+    const rank = wordFrequencies!.get(lookupWord);
+    if (rank == null) return false;
+    return rank >= freqMin! && rank <= freqMax!;
+  }, [hasFreqRange, wordFrequencies, freqMin, freqMax]);
 
   // Auto-scroll to keep current word visible
   useEffect(() => {
@@ -86,8 +113,38 @@ export function TranscriptPanel({
         return;
       }
 
-      // Seek video to this word's timestamp
-      onWordClick(word);
+      // Extract the sentence containing this word by scanning for punctuation
+      // in the words array. GPT-4o already attached punctuation to each word
+      // (e.g. "привет." or "сказал,"), so we find sentence boundaries by
+      // looking for words ending in . ! ? or …
+      const words = transcript.words;
+      const clickedIdx = words.indexOf(word);
+      if (clickedIdx >= 0) {
+        const endsPunctuation = /[.!?…]$/;
+        // Scan backward to find sentence start (word after previous sentence-ender)
+        let sentenceStart = 0;
+        for (let i = clickedIdx - 1; i >= 0; i--) {
+          if (endsPunctuation.test(words[i].word.trim())) {
+            sentenceStart = i + 1;
+            break;
+          }
+        }
+        // Scan forward to find sentence end (first word with sentence-ending punctuation)
+        let sentenceEnd = words.length - 1;
+        for (let i = clickedIdx; i < words.length; i++) {
+          if (endsPunctuation.test(words[i].word.trim())) {
+            sentenceEnd = i;
+            break;
+          }
+        }
+        const sentence = words.slice(sentenceStart, sentenceEnd + 1)
+          .map(w => w.word)
+          .join('')
+          .trim();
+        setSelectedContext(sentence || undefined);
+      } else {
+        setSelectedContext(undefined);
+      }
 
       // Show translation popup
       setSelectedWord(word);
@@ -112,11 +169,12 @@ export function TranscriptPanel({
         setIsTranslating(false);
       }
     },
-    [config.googleApiKey, onWordClick]
+    [config.googleApiKey, transcript.segments]
   );
 
   const handleClosePopup = useCallback(() => {
     setSelectedWord(null);
+    setSelectedContext(undefined);
     setPopupPosition(null);
     setTranslation(null);
     setTranslationError(null);
@@ -148,6 +206,7 @@ export function TranscriptPanel({
           const isCurrentWord = index === currentWordIndex;
           const isPastWord = index < currentWordIndex;
           const isClickable = isRussianWord(word.word);
+          const isFreqWord = isInFreqRange(word);
 
           return (
             <span
@@ -159,6 +218,7 @@ export function TranscriptPanel({
                 ${isCurrentWord ? 'bg-yellow-300 font-medium' : ''}
                 ${isPastWord ? 'text-gray-500' : 'text-gray-900'}
                 ${selectedWord === word ? 'bg-blue-200' : ''}
+                ${isFreqWord ? 'underline decoration-2 decoration-blue-400' : ''}
                 transition-colors rounded px-0.5
               `}
             >
@@ -175,6 +235,9 @@ export function TranscriptPanel({
         error={translationError}
         position={popupPosition}
         onClose={handleClosePopup}
+        onAddToDeck={onAddToDeck}
+        isInDeck={selectedWord ? isWordInDeck?.(selectedWord.word) : false}
+        context={selectedContext}
       />
 
       {/* Progress indicator */}

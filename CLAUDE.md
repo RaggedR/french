@@ -4,148 +4,145 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Russian Video Transcription - a web app for watching Russian videos (primarily from ok.ru) with synced transcripts and click-to-translate functionality. Users paste video URLs, the backend downloads the video and transcribes it with OpenAI Whisper, then splits long videos into chunks for easier viewing. Words are highlighted as the video plays.
+Russian Video Transcription - a web app for watching Russian videos (primarily from ok.ru) with synced transcripts and click-to-translate functionality. Users paste video URLs, the backend downloads the video, transcribes it with OpenAI Whisper, adds punctuation/spelling corrections via GPT-4o, then splits long videos into chunks for easier viewing. Words are highlighted as the video plays.
 
 ## Commands
 
 ```bash
-npm run dev           # Start both frontend and backend servers
+npm run dev           # Start both frontend and backend (kills stale servers first)
 npm run dev:frontend  # Start Vite dev server only
-npm run dev:backend   # Start Express backend only
+npm run dev:backend   # Start Express backend only (uses --watch)
 npm run build         # TypeScript check + production build
 npm run lint          # Run ESLint
-npm run preview       # Preview production build
+npm run test          # Run ALL tests (frontend typecheck + server unit + integration)
 npm run server:install # Install backend dependencies
 ```
 
+### Testing
+
+```bash
+# Run all tests (frontend + backend)
+npm test
+
+# Server unit tests only
+cd server && npx vitest run
+
+# Server tests in watch mode
+cd server && npx vitest
+
+# Run a single test file
+cd server && npx vitest run media.test.js
+cd server && npx vitest run integration.test.js
+
+# Run tests matching a pattern
+cd server && npx vitest run -t "editDistance"
+
+# Integration tests against real APIs (requires network + API keys)
+cd server && npm run test:integration
+```
+
+**Test files:**
+- `tests/typecheck.test.js` — Runs `tsc -b` to catch TypeScript errors (30s timeout)
+- `server/media.test.js` — Unit tests for heartbeat, stripPunctuation, editDistance, isFuzzyMatch
+- `server/integration.test.js` — Mocks `media.js`, tests all Express endpoints, SSE, session lifecycle
+
 ## Setup
 
-1. Install frontend dependencies: `npm install`
-2. Install backend dependencies: `npm run server:install`
-3. Ensure yt-dlp and ffmpeg are installed: `brew install yt-dlp ffmpeg`
-4. Create `.env` file in project root with:
+1. `npm install && npm run server:install`
+2. `brew install yt-dlp ffmpeg`
+3. Create `.env` in project root:
    ```
    OPENAI_API_KEY=sk-...
    GOOGLE_TRANSLATE_API_KEY=AIza...
    ```
-5. (Optional) Configure Google API key in Settings panel for translations
 
 ## Architecture
 
 ### Thin Client Design
 
-The frontend is a **thin client** - the backend owns all session state. The frontend only manages:
-- View state (`input`, `analyzing`, `chunk-menu`, `loading-chunk`, `player`)
-- Current playback state (videoUrl, transcript, currentTime)
-- UI state (errors)
-
-The backend stores:
-- Session data (title, transcript, video path)
-- Chunk status (`pending` | `downloading` | `ready`)
-- Chunk video URLs and transcripts
+The frontend is a **thin client** — the backend owns all session state. The frontend only manages view state (`input` | `analyzing` | `chunk-menu` | `loading-chunk` | `player`), current playback state, and UI errors.
 
 ### Core Flow
 ```
 1. User pastes ok.ru URL
-2. POST /api/analyze → backend downloads video + transcribes
+2. POST /api/analyze → scrape metadata (fast) → download audio → transcribe → punctuate → chunk
 3. SSE /api/progress/:sessionId → real-time progress updates
-4. Backend creates chunks (5-10 min segments)
+4. Backend creates chunks (3-5 min segments at natural pauses)
 5. If 1 chunk → auto-download; else → show chunk menu
-6. POST /api/download-chunk → ffmpeg extracts segment
+6. POST /api/download-chunk → yt-dlp extracts video segment
 7. GET /api/session/:sessionId/chunk/:chunkId → fetch chunk data
-8. Video plays with synced transcript highlighting
+8. Video plays with synced transcript highlighting, click-to-translate
 ```
 
-### Key Types (`src/types/index.ts`)
+### Session Persistence
 
-- `WordTimestamp` - Word with start/end times in seconds
-- `Transcript` - Collection of words, segments, language, duration
-- `VideoChunk` - Chunk with id, startTime, endTime, status, videoUrl
-- `SessionResponse` - Response from GET /api/session/:sessionId
-- `ChunkResponse` - Response from GET /api/session/:sessionId/chunk/:chunkId
-- `AppView` - View state machine
+- **Local dev**: In-memory Maps, videos in `server/temp/`, lost on restart
+- **Production (GCS)**: Sessions in `gs://russian-transcription-videos/sessions/`, videos in `videos/`, extraction cache in `cache/`
+- `chunkTranscripts` is a Map — serialized as `Array.from(map.entries())` for JSON/GCS storage, restored with `new Map(array)`
+- URL session cache (6h TTL), extraction cache (2h TTL), translation cache (in-memory)
 
 ### Backend (`server/`)
 
-Express.js server running on port 3001:
+Express.js on port 3001. Single file `index.js` for routing/session management, `media.js` for external tool integration.
 
-**Media Functions (`server/media.js`):**
-- **`createHeartbeat(onProgress, type, messageBuilder, intervalMs)`**: Reusable heartbeat for showing "Connecting... (Xs)" during long operations
-- **`downloadAudioChunk(url, outputPath, startTime, endTime, options)`**: Downloads audio segment using yt-dlp
-- **`downloadVideoChunk(url, outputPath, startTime, endTime, options)`**: Downloads video segment using yt-dlp
-- **`transcribeAudioChunk(audioPath, options)`**: Transcribes audio using OpenAI Whisper API
+**API Endpoints:**
 
-**Session Management:**
-- **POST /api/analyze**: Downloads video, transcribes with Whisper, creates chunks
-- **GET /api/session/:sessionId**: Get session data including chunk status
-- **GET /api/session/:sessionId/chunk/:chunkId**: Get chunk video URL and transcript
-- **POST /api/download-chunk**: Extract chunk from source video using yt-dlp
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/health` | Health check |
+| POST | `/api/analyze` | Start analysis (returns cached if URL seen before) |
+| GET | `/api/session/:sessionId` | Get session data + chunk statuses |
+| GET | `/api/session/:sessionId/chunk/:chunkId` | Get ready chunk's video URL + transcript |
+| POST | `/api/download-chunk` | Download a chunk (waits if prefetch in progress) |
+| POST | `/api/load-more-chunks` | Load next batch for long videos |
+| DELETE | `/api/session/:sessionId` | Delete session + all videos |
+| POST | `/api/translate` | Google Translate proxy with caching |
+| GET | `/api/progress/:sessionId` | SSE stream for progress events |
 
-**Translation:**
-- **POST /api/translate**: Proxies to Google Translate API with caching
+**`server/media.js` — External tool functions:**
+- `getOkRuVideoInfo(url)` — Fast HTML scraping of ok.ru OG tags (~4s vs yt-dlp's ~15s)
+- `downloadAudioChunk(url, outputPath, startTime, endTime, options)` — yt-dlp audio download with phase-aware progress
+- `downloadVideoChunk(url, outputPath, startTime, endTime, options)` — yt-dlp video download
+- `transcribeAudioChunk(audioPath, options)` — OpenAI Whisper API
+- `addPunctuation(transcript, options)` — GPT-4o punctuation + spelling correction with two-pointer word alignment
+- `createHeartbeat(onProgress, type, messageBuilder, intervalMs)` — Progress heartbeat during long operations
+- `stripPunctuation(word)`, `editDistance(a, b)`, `isFuzzyMatch(a, b)` — String utilities for word alignment
 
-**Progress Updates:**
-- **GET /api/progress/:sessionId**: Server-Sent Events for real-time progress
+**`server/chunking.js` — Chunking logic:**
+- `createChunks(transcript)` — Splits at natural pauses (>0.5s gaps), targets ~3min chunks, merges final chunk if <2min
+- `getChunkTranscript(transcript, startTime, endTime)` — Extract and time-adjust words/segments for a chunk
+- `formatTime(seconds)` — Format as "MM:SS"
 
-### Testing
+**`server/index.js` — Key internal state:**
+- `analysisSessions` Map — Session data (backed by GCS in production)
+- `urlSessionCache` Map — URL → sessionId for instant re-access
+- `translationCache` Map — Translation results
+- `progressClients` Map — Active SSE connections
+- `prefetchNextChunk()` — Background download of next chunk after current completes
 
-```bash
-# Unit tests (vitest)
-cd server && npm test           # Run once
-cd server && npm run test:watch # Watch mode
+### Frontend
 
-# Integration tests (requires network, API keys)
-cd server && npm run test:integration
-```
-
-**Test video:** https://ok.ru/video/400776431053 (Russian, clear speech, >30 min)
-
-Integration test procedure:
-1. Download audio for third batch (40:00 - 60:00) - tests `downloadAudioChunk`
-2. Transcribe that audio - tests `transcribeAudioChunk`
-3. Download video for third part of third batch (~46:00 - 49:00) - tests `downloadVideoChunk`
-
-### Frontend Components
-
-- **`App.tsx`**: Thin client state machine, manages view transitions
-- **`VideoInput.tsx`**: URL input for video transcription
-- **`VideoPlayer.tsx`**: HTML5 video with 100ms time polling for smooth word sync
-- **`TranscriptPanel.tsx`**: Words with current-word highlighting, auto-scroll, click-to-translate
-- **`ChunkMenu.tsx`**: Shows video chunks with status indicators
-- **`WordPopup.tsx`**: Shows translation with pronunciation button
-- **`SettingsPanel.tsx`**: Configure Google API key for translations
+- `App.tsx` — State machine managing view transitions, SSE subscriptions
+- `src/services/api.ts` — API client with SSE + polling fallback. SSE connects directly to backend (bypasses Vite proxy buffering in dev)
+- `src/types/index.ts` — Shared types: `WordTimestamp`, `Transcript`, `VideoChunk`, `SessionResponse`, `ProgressState`
 
 ### Deployment
 
-Production uses Google Cloud Run with GCS storage:
-- Videos: `gs://russian-transcription-videos/videos/`
-- API keys from Secret Manager
-
-Deploy scripts:
-- `./quick-deploy.sh` - Fast deploy (rebuild + push)
-- `./deploy.sh` - Full deploy with secrets
+Production uses Google Cloud Run + GCS + Firebase Hosting:
+- `./deploy.sh` — Full deploy with secrets, GCS bucket setup, lifecycle policies
+- `./quick-deploy.sh` — Fast local Docker build + push
 
 ## Tech Stack
 
-- React 19 + TypeScript + Vite 7
-- Tailwind CSS v4
-- Express.js backend with Server-Sent Events
-- OpenAI Whisper API (transcription)
-- Google Translate API (translation)
-- yt-dlp (video download)
-- ffmpeg (audio extraction, video chunking)
-- Google Cloud Storage (production)
-
-## System Requirements
-
-- Node.js 18+
-- yt-dlp (`brew install yt-dlp`)
-- ffmpeg (`brew install ffmpeg`)
+- React 19 + TypeScript + Vite 7, Tailwind CSS v4
+- Express.js with Server-Sent Events
+- OpenAI Whisper API (transcription) + GPT-4o (punctuation/spelling)
+- Google Translate API, Google Cloud Storage
+- yt-dlp + ffmpeg (video/audio processing)
 
 ## Known Limitations
 
-- **ok.ru focus**: Optimized for ok.ru videos
-- **IP-locked URLs**: ok.ru URLs are IP-locked, so we download full videos
-- **Long videos**: Split into 5-10 min chunks
-- **Cold starts**: Cloud Run cold starts add ~5s to first request
-- **Local sessions**: Sessions stored in memory locally, not persisted across restarts
+- **ok.ru focus**: Optimized for ok.ru videos (IP-locked URLs require full download)
+- **Long videos**: Split into 3-5 min chunks, loaded in batches
+- **Local sessions**: In-memory only, lost on restart (production persists to GCS)
+- **ok.ru extraction**: Takes 90-120s due to anti-bot JS protection (`ESTIMATED_EXTRACTION_TIME = 100`)

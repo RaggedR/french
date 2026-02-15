@@ -37,15 +37,17 @@ export interface AnalysisCompleteData {
   totalDuration: number;
   chunks: VideoChunk[];
   hasMoreChunks: boolean;
+  contentType?: 'video' | 'text';
 }
 
 export interface ProgressEvent {
-  type: 'audio' | 'transcription' | 'punctuation' | 'video' | 'complete' | 'error' | 'connected';
+  type: 'audio' | 'transcription' | 'punctuation' | 'lemmatization' | 'video' | 'tts' | 'complete' | 'error' | 'connected';
   progress: number;
   status: 'active' | 'complete' | 'error';
   message?: string;
   // For complete event
   title?: string;
+  contentType?: 'video' | 'text';
   totalDuration?: number;
   chunks?: VideoChunk[];
   hasMoreChunks?: boolean;
@@ -102,6 +104,7 @@ export function subscribeToProgress(
               totalDuration: data.totalDuration || 0,
               chunks: data.chunks,
               hasMoreChunks: data.hasMoreChunks || false,
+              contentType: data.contentType,
             });
           }
           // Always cleanup on complete
@@ -116,7 +119,7 @@ export function subscribeToProgress(
         }
 
         // Progress update
-        if (data.type === 'audio' || data.type === 'transcription' || data.type === 'punctuation' || data.type === 'video') {
+        if (data.type === 'audio' || data.type === 'transcription' || data.type === 'punctuation' || data.type === 'lemmatization' || data.type === 'video' || data.type === 'tts') {
           onProgress({
             type: data.type,
             progress: data.progress,

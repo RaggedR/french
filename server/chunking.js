@@ -181,6 +181,130 @@ export function getChunkTranscript(transcript, startTime, endTime) {
   };
 }
 
+const TARGET_TEXT_CHUNK_CHARS = 3500; // Under 4096 TTS limit
+const MIN_FINAL_TEXT_CHUNK_CHARS = 500;
+
+/**
+ * Split a long text block into sentence-boundary pieces that fit under the TTS limit.
+ * Russian sentences end with . ! ? (or » followed by punctuation).
+ * @param {string} block - Text block (may be many thousands of chars)
+ * @returns {string[]} Array of pieces, each ≤ TARGET_TEXT_CHUNK_CHARS
+ */
+function splitBlockIntoSentences(block) {
+  // Match sentence-ending punctuation followed by whitespace
+  const sentenceEnds = /([.!?»…])\s+/g;
+  const pieces = [];
+  let current = '';
+  let lastIndex = 0;
+
+  for (const match of block.matchAll(sentenceEnds)) {
+    const sentenceEnd = match.index + match[0].length - (match[0].length - match[1].length);
+    const sentence = block.slice(lastIndex, sentenceEnd + 1);
+    lastIndex = sentenceEnd + 1;
+    // Skip leading whitespace
+    const nextNonSpace = block.slice(lastIndex).search(/\S/);
+    if (nextNonSpace > 0) lastIndex += nextNonSpace;
+
+    if (current.length + sentence.length > TARGET_TEXT_CHUNK_CHARS && current.length > 0) {
+      pieces.push(current.trim());
+      current = sentence;
+    } else {
+      current += sentence;
+    }
+  }
+
+  // Remaining text after last sentence boundary
+  if (lastIndex < block.length) {
+    const remainder = block.slice(lastIndex);
+    if (current.length + remainder.length > TARGET_TEXT_CHUNK_CHARS && current.length > 0) {
+      pieces.push(current.trim());
+      current = remainder;
+    } else {
+      current += remainder;
+    }
+  }
+
+  if (current.trim().length > 0) {
+    pieces.push(current.trim());
+  }
+
+  return pieces;
+}
+
+/**
+ * Create chunks from a plain text string for TTS processing.
+ * Handles lib.ru-style formatting where lines are wrapped at ~72 chars with single newlines.
+ * Each chunk stays under ~3500 chars to fit within OpenAI TTS's 4096-char limit.
+ * @param {string} text - Full text content
+ * @returns {Array<Object>} Array of text chunk objects
+ */
+export function createTextChunks(text) {
+  // Step 1: Split on double-newlines (section breaks)
+  const sections = text.split(/\n\s*\n/).filter(s => s.trim().length > 0);
+
+  if (sections.length === 0) {
+    return [makeTextChunk(0, text.trim())];
+  }
+
+  // Step 2: Unwrap line-wrapped paragraphs within each section.
+  // lib.ru wraps at ~72 chars using single newlines within paragraphs.
+  // Join single newlines with spaces, preserving double-newline section breaks.
+  const normalizedSections = sections.map(s => {
+    return s.trim().replace(/([^\n])\n([^\n])/g, '$1 $2').replace(/\s+/g, ' ').trim();
+  });
+
+  // Step 3: Break sections into TTS-sized pieces
+  const allPieces = [];
+  for (const section of normalizedSections) {
+    if (section.length <= TARGET_TEXT_CHUNK_CHARS) {
+      allPieces.push(section);
+    } else {
+      // Section too long — split on sentence boundaries
+      allPieces.push(...splitBlockIntoSentences(section));
+    }
+  }
+
+  // Step 4: Accumulate pieces into chunks (merge small pieces together)
+  const chunks = [];
+  let currentText = '';
+
+  for (const piece of allPieces) {
+    // Short pieces (section dividers like "* * *") always merge with neighbors
+    const isShort = piece.length < 50;
+    const combined = currentText ? currentText + '\n\n' + piece : piece;
+
+    if (!isShort && combined.length > TARGET_TEXT_CHUNK_CHARS && currentText.length > 0) {
+      chunks.push(makeTextChunk(chunks.length, currentText));
+      currentText = piece;
+    } else {
+      currentText = combined;
+    }
+  }
+
+  // Handle remaining text
+  if (currentText.length > 0) {
+    if (currentText.length < MIN_FINAL_TEXT_CHUNK_CHARS && chunks.length > 0) {
+      const prev = chunks[chunks.length - 1];
+      chunks[chunks.length - 1] = makeTextChunk(prev.index, prev.text + '\n\n' + currentText);
+    } else {
+      chunks.push(makeTextChunk(chunks.length, currentText));
+    }
+  }
+
+  return chunks;
+}
+
+function makeTextChunk(index, text) {
+  return {
+    id: `chunk-${index}`,
+    index,
+    text,
+    previewText: text.slice(0, 100) + (text.length > 100 ? '...' : ''),
+    wordCount: text.split(/\s+/).length,
+    status: 'pending',
+  };
+}
+
 /**
  * Format time in MM:SS format
  */

@@ -1,13 +1,16 @@
-import type { ProgressState } from '../types';
+import type { ProgressState, ContentType } from '../types';
 
 interface ProgressBarProps {
   progress: ProgressState[];
+  contentType?: ContentType;
 }
 
 const typeLabels: Record<ProgressState['type'], string> = {
   audio: 'Audio',
   transcription: 'Transcription',
   punctuation: 'Punctuation',
+  lemmatization: 'Lemmatization',
+  tts: 'Text-to-Speech',
   video: 'Video',
 };
 
@@ -15,10 +18,12 @@ const typeColors: Record<ProgressState['type'], string> = {
   audio: 'bg-blue-500',
   transcription: 'bg-green-500',
   punctuation: 'bg-yellow-500',
+  lemmatization: 'bg-orange-500',
+  tts: 'bg-cyan-500',
   video: 'bg-purple-500',
 };
 
-export function ProgressBar({ progress }: ProgressBarProps) {
+export function ProgressBar({ progress, contentType }: ProgressBarProps) {
   if (progress.length === 0) {
     return null;
   }
@@ -29,7 +34,7 @@ export function ProgressBar({ progress }: ProgressBarProps) {
         <div key={p.type} className="space-y-2">
           <div className="flex justify-between text-sm">
             <span className="font-medium text-gray-700">
-              {typeLabels[p.type]}
+              {p.type === 'audio' && contentType === 'text' ? 'lib.ru' : typeLabels[p.type]}
             </span>
             <span className="text-gray-500">
               {p.status === 'complete' ? '100%' : `${p.progress}%`}
