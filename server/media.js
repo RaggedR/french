@@ -13,6 +13,37 @@ const ytdlp = ytdlpBase.create('yt-dlp');
 // ok.ru extraction typically takes 90-120 seconds due to their anti-bot JS protection
 const ESTIMATED_EXTRACTION_TIME = 100; // seconds
 
+/**
+ * Map a substage's 0-100 progress into its allocated range within the overall bar.
+ * @param {number} substageProgress - Progress within the substage (0-100)
+ * @param {number} rangeStart - Start of the substage's range in the overall bar (0-100)
+ * @param {number} rangeEnd - End of the substage's range in the overall bar (0-100)
+ * @returns {number} Overall progress percentage
+ */
+function mapProgress(substageProgress, rangeStart, rangeEnd) {
+  return Math.round(rangeStart + (substageProgress / 100) * (rangeEnd - rangeStart));
+}
+
+/**
+ * Compute range boundaries from an array of substage weights.
+ * E.g. weights [60, 45, 5] → ranges [[0, 55], [55, 96], [96, 100]]
+ * @param {number[]} weights - Estimated durations for each substage
+ * @returns {number[][]} Array of [rangeStart, rangeEnd] pairs
+ */
+function computeRanges(weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  const ranges = [];
+  let cursor = 0;
+  for (const w of weights) {
+    const rangeEnd = cursor + (w / total) * 100;
+    ranges.push([Math.round(cursor), Math.round(rangeEnd)]);
+    cursor = rangeEnd;
+  }
+  // Ensure last range ends at exactly 100
+  if (ranges.length > 0) ranges[ranges.length - 1][1] = 100;
+  return ranges;
+}
+
 // Process-level timeout: kills yt-dlp if it hangs (ok.ru CDN can be unreachable)
 // 240s leaves a 60s buffer before Cloud Run's 300s request timeout
 const YTDLP_TIMEOUT_MS = 240_000;
@@ -99,23 +130,30 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
   const sectionSpec = `*${formatTime(startTime)}-${formatTime(endTime)}`;
   const targetDuration = formatTime(duration);
 
-  // Heartbeat with phase-aware messages and estimated progress during extraction
+  // Substage weights: [extraction, download, finalization] in estimated seconds
+  const hasCachedInfo = cachedInfoPath && fs.existsSync(cachedInfoPath);
+  const weights = hasCachedInfo ? [2, 45, 5] : [60, 45, 5];
+  const ranges = computeRanges(weights);
+  const [extractionRange, downloadRange, finalizationRange] = ranges;
+  const extractionEstimate = weights[0];
+
+  // Heartbeat with phase-aware messages using substage ranges
   let phase = 'connecting';
   const heartbeat = createHeartbeat(
     onProgress,
     'audio',
     (s) => {
       if (phase === 'connecting' || phase === 'extracting') {
-        // Show estimated progress during extraction (cap at 45% to leave room for download)
-        const estimatedPercent = Math.min(45, Math.round((s / ESTIMATED_EXTRACTION_TIME) * 50));
-        const remaining = Math.max(0, ESTIMATED_EXTRACTION_TIME - s);
-        const msg = `Step 1/3: Finding video stream... ${s}s (~${remaining}s remaining)`;
-        return { percent: estimatedPercent, message: msg };
+        // Smooth fill over 1.5x the estimated extraction time (never reaches 100% of range)
+        const subPct = Math.min(95, Math.round((s / (extractionEstimate * 1.5)) * 100));
+        const pct = mapProgress(subPct, extractionRange[0], extractionRange[1]);
+        const remaining = Math.max(0, extractionEstimate - s);
+        return { percent: pct, message: `Step 1/3: Finding video stream... ${s}s (~${remaining}s remaining)` };
       }
       if (phase === 'starting') {
-        return { percent: 50, message: `Step 2/3: Starting download... (${s}s)` };
+        return { percent: downloadRange[0], message: `Step 2/3: Starting download... (${s}s)` };
       }
-      return { percent: 50, message: `Processing... (${s}s)` };
+      return { percent: downloadRange[0], message: `Processing... (${s}s)` };
     }
   );
 
@@ -143,12 +181,10 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
   }
 
   // Use cached extraction info to skip the slow extraction phase
-  if (cachedInfoPath && fs.existsSync(cachedInfoPath)) {
+  if (hasCachedInfo) {
     args.push('--load-info-json', cachedInfoPath);
-    // Using cached extraction - progress will show in sendProgress
-    // Skip directly to download phase since extraction is cached
     phase = 'starting';
-    onProgress('audio', 50, 'active', 'Step 1/3: Using cached video info...');
+    onProgress('audio', downloadRange[0], 'active', 'Step 1/3: Using cached video info...');
   }
 
   let videoInfo = null;
@@ -170,6 +206,7 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
 
     let lastProgress = 0;
     let lastAudioSize = 0;
+    let finalizationStart = 0;
 
     // Monitor file size during download (check for partial files too)
     const audioMonitor = setInterval(() => {
@@ -194,7 +231,8 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
               if (phase === 'starting' || phase === 'downloading') {
                 phase = 'downloading';
                 heartbeat.stop();
-                onProgress('audio', Math.max(lastProgress, 10), 'active',
+                const pct = Math.max(lastProgress, downloadRange[0]);
+                onProgress('audio', pct, 'active',
                   `Step 2/3: Downloading audio... (${sizeMB} MB)`);
               }
             }
@@ -216,7 +254,7 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
       } else if (line.includes('Destination:') || line.includes('format(s)')) {
         phase = 'starting';
         heartbeat.stop();
-        onProgress('audio', 5, 'active', 'Step 2/3: Starting download...');
+        onProgress('audio', downloadRange[0], 'active', 'Step 2/3: Starting download...');
       }
     });
 
@@ -239,7 +277,9 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
       // Detect finalization phase (after download, during ffmpeg conversion)
       if (line.includes('Deleting original file') || line.includes('Post-process')) {
         heartbeat.stop();
-        onProgress('audio', 99, 'active', 'Step 2/3: Finalizing audio...');
+        phase = 'finalizing';
+        finalizationStart = Date.now();
+        onProgress('audio', finalizationRange[0], 'active', 'Step 3/3: Finalizing audio...');
         return;
       }
 
@@ -252,8 +292,9 @@ export async function downloadAudioChunk(url, outputPath, startTime, endTime, op
         const mins = parseInt(timeMatch[2]);
         const secs = parseInt(timeMatch[3]);
         const currentSecs = hours * 3600 + mins * 60 + secs;
-        // Cap at 95% to leave room for finalization message
-        const percent = Math.min(95, Math.round((currentSecs / duration) * 100));
+        // Map download progress into its allocated range
+        const subPct = Math.min(100, Math.round((currentSecs / duration) * 100));
+        const percent = mapProgress(subPct, downloadRange[0], downloadRange[1]);
         if (percent > lastProgress) {
           lastProgress = percent;
           const timeMsg = `${formatTime(currentSecs)} / ${targetDuration}`;
@@ -331,7 +372,16 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
   const { onProgress = () => {}, partNum = 1, cachedInfoPath = null } = options;
   const sectionSpec = `*${formatTime(startTime)}-${formatTime(endTime)}`;
 
-  let phase = cachedInfoPath && fs.existsSync(cachedInfoPath) ? 'starting' : 'extracting';
+  // Substage weights: [extraction, download, upload] in estimated seconds
+  // Upload range is reserved for index.js to use when uploading to GCS
+  const hasCachedInfo = cachedInfoPath && fs.existsSync(cachedInfoPath);
+  const weights = hasCachedInfo ? [2, 25, 10] : [60, 25, 10];
+  const ranges = computeRanges(weights);
+  const [extractionRange, downloadRange, uploadRange] = ranges;
+  const extractionEstimate = weights[0];
+
+  let phase = hasCachedInfo ? 'starting' : 'extracting';
+  let downloadStart = Date.now();
 
   // Heartbeat with estimated progress during extraction
   const heartbeat = createHeartbeat(
@@ -339,22 +389,26 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
     'video',
     (s) => {
       if (phase === 'extracting') {
-        const estimatedPercent = Math.min(45, Math.round((s / ESTIMATED_EXTRACTION_TIME) * 50));
-        const remaining = Math.max(0, ESTIMATED_EXTRACTION_TIME - s);
-        const msg = `Part ${partNum}: Finding stream... ${s}s (~${remaining}s remaining)`;
-        return { percent: estimatedPercent, message: msg };
+        const subPct = Math.min(95, Math.round((s / (extractionEstimate * 1.5)) * 100));
+        const pct = mapProgress(subPct, extractionRange[0], extractionRange[1]);
+        const remaining = Math.max(0, extractionEstimate - s);
+        return { percent: pct, message: `Part ${partNum}: Finding stream... ${s}s (~${remaining}s remaining)` };
       }
-      if (phase === 'starting') {
-        return { percent: 50, message: `Part ${partNum}: Starting download... (${s}s)` };
+      if (phase === 'starting' || phase === 'downloading') {
+        // Time-estimate within download range (no real file-size progress available)
+        const elapsed = (Date.now() - downloadStart) / 1000;
+        const subPct = Math.min(95, Math.round((elapsed / (weights[1] * 1.5)) * 100));
+        const pct = mapProgress(subPct, downloadRange[0], downloadRange[1]);
+        return { percent: pct, message: `Part ${partNum}: Downloading... (${s}s)` };
       }
-      return { percent: 55, message: `Part ${partNum}: Downloading... (${s}s)` };
+      return { percent: downloadRange[0], message: `Part ${partNum}: Processing... (${s}s)` };
     }
   );
 
   if (phase === 'extracting') {
     onProgress('video', 0, 'active', `Part ${partNum}: Finding stream...`);
   } else {
-    onProgress('video', 50, 'active', `Part ${partNum}: Using cached info...`);
+    onProgress('video', downloadRange[0], 'active', `Part ${partNum}: Using cached info...`);
   }
 
   let lastVideoSize = 0;
@@ -365,14 +419,16 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
       if (checkPath) {
         const stats = fs.statSync(checkPath);
         const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
-        // Stop heartbeat once download actually starts
-        if (stats.size > 0) {
+        // Transition to download phase once file appears
+        if (stats.size > 0 && phase === 'extracting') {
           heartbeat.stop();
           phase = 'downloading';
+          downloadStart = Date.now();
         }
         if (stats.size !== lastVideoSize) {
           lastVideoSize = stats.size;
-          onProgress('video', 60, 'active', `Part ${partNum}: Downloading... (${sizeMB} MB)`);
+          // Let heartbeat handle progress (it time-estimates within download range)
+          // Just update the size in the message
         }
       }
     } catch (e) {
@@ -419,7 +475,8 @@ export async function downloadVideoChunk(url, outputPath, startTime, endTime, op
 
   const size = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
   const sizeMB = (size / 1024 / 1024).toFixed(1);
-  onProgress('video', 100, 'complete', `Video ready (${sizeMB} MB)`);
+  // Report download complete at upload range start — index.js handles upload progress and final 100%
+  onProgress('video', uploadRange[0], 'active', `Part ${partNum}: Download complete (${sizeMB} MB)`);
 
   return { size };
 }
@@ -448,9 +505,9 @@ export async function transcribeAudioChunk(audioPath, options = {}) {
   const sizeMB = stats.size / 1024 / 1024;
   const sizeMBStr = sizeMB.toFixed(1);
 
-  // Generous estimate: ~7 seconds per MB of audio
-  // This ensures progress bar jumps from ~80% to complete rather than hanging at 95%
-  const estimatedSeconds = Math.max(Math.round(sizeMB * 7), 45);
+  // Over-estimate: ~10 seconds per MB — better to reach 70% and jump to 100%
+  // than hang at 95% for a long time
+  const estimatedSeconds = Math.max(Math.round(sizeMB * 10), 45);
 
   const startTime = Date.now();
   onProgress('transcription', 0, 'active',
@@ -459,8 +516,8 @@ export async function transcribeAudioChunk(audioPath, options = {}) {
   const transcribeInterval = setInterval(() => {
     const elapsed = Math.round((Date.now() - startTime) / 1000);
     const remaining = Math.max(0, estimatedSeconds - elapsed);
-    // Cap at 85% so there's a visible jump to 100% when complete
-    const percent = Math.min(85, Math.round((elapsed / estimatedSeconds) * 100));
+    // Cap at 95% so progress reaches near-completion before the jump to 100%
+    const percent = Math.min(95, Math.round((elapsed / estimatedSeconds) * 100));
     onProgress('transcription', percent, 'active',
       `Step 3/3: Transcribing... ${elapsed}s elapsed, ~${remaining}s remaining`);
   }, 2000);
@@ -584,7 +641,7 @@ export async function addPunctuation(transcript, options = {}) {
 
     const batchNum = Math.floor(i / BATCH_SIZE) + 1;
     const totalBatches = Math.ceil(transcript.words.length / BATCH_SIZE);
-    const percent = Math.round((i / transcript.words.length) * 80);
+    const percent = Math.round((i / transcript.words.length) * 95);
     onProgress('punctuation', percent, 'active',
       `Adding punctuation... (batch ${batchNum}/${totalBatches})`);
 
@@ -768,13 +825,27 @@ export async function lemmatizeWords(transcript, options = {}) {
   const BATCH_SIZE = 300;
   const lemmaMap = new Map();
 
+  // Estimate ~5s per batch of 300 words for time-based progress during API calls
+  const totalBatches = Math.ceil(uniqueWords.length / BATCH_SIZE);
+  const estimatedSecsPerBatch = 12;
+
   for (let i = 0; i < uniqueWords.length; i += BATCH_SIZE) {
     const batch = uniqueWords.slice(i, i + BATCH_SIZE);
     const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    const totalBatches = Math.ceil(uniqueWords.length / BATCH_SIZE);
-    const percent = Math.round((i / uniqueWords.length) * 90);
-    onProgress('lemmatization', percent, 'active',
+    const batchRangeStart = Math.round((i / uniqueWords.length) * 95);
+    const batchRangeEnd = Math.round(((i + batch.length) / uniqueWords.length) * 95);
+    onProgress('lemmatization', batchRangeStart, 'active',
       `Lemmatizing... (batch ${batchNum}/${totalBatches})`);
+
+    // Heartbeat within each batch so single-batch runs don't show 0% → 100%
+    const batchStart = Date.now();
+    const batchHeartbeat = setInterval(() => {
+      const elapsed = (Date.now() - batchStart) / 1000;
+      const subPct = Math.min(90, Math.round((elapsed / (estimatedSecsPerBatch * 1.5)) * 100));
+      const pct = mapProgress(subPct, batchRangeStart, batchRangeEnd);
+      onProgress('lemmatization', pct, 'active',
+        `Lemmatizing... (batch ${batchNum}/${totalBatches}, ${Math.round(elapsed)}s)`);
+    }, 1500);
 
     try {
       const response = await openai.chat.completions.create({
@@ -783,7 +854,7 @@ export async function lemmatizeWords(transcript, options = {}) {
         messages: [
           {
             role: 'system',
-            content: `You are a Russian morphology tool. For each word, return its dictionary lemma (nominative singular for nouns/adjectives, masculine nominative singular for adjectives/participles, infinitive for verbs). Return ONLY a JSON object mapping each input word to its lemma. No explanation.`,
+            content: `You are a Russian morphology tool. For each word, return its most commonly used dictionary lemma (nominative singular for nouns, masculine nominative singular for adjectives, infinitive for verbs). Prefer the everyday form over literary forms (e.g. маленький over малый, большой over великий). For short-form adjectives (мал, мала, велик, велика, etc.), return the common full-form adjective. Return ONLY a JSON object mapping each input word to its lemma. No explanation.`,
           },
           {
             role: 'user',
@@ -807,6 +878,8 @@ export async function lemmatizeWords(transcript, options = {}) {
     } catch (err) {
       console.error(`[Lemmatize] Error in batch ${batchNum}:`, err.message);
       // Skip this batch — words will just have no lemma
+    } finally {
+      clearInterval(batchHeartbeat);
     }
   }
 
@@ -946,6 +1019,11 @@ ${numberedHeader}`
       console.log(`[LibRu] GPT-4o-mini returned invalid line number: ${response.choices[0].message.content}, using full text`);
     }
   } catch (err) {
+    // Quota/auth errors mean ALL subsequent OpenAI calls (TTS, lemmatization) will also fail.
+    // Fail fast rather than proceeding with garbage text.
+    if (err.status === 429 || err.code === 'insufficient_quota' || err.status === 401) {
+      throw new Error('OpenAI API quota exceeded. Add credits at https://platform.openai.com/settings/organization/billing');
+    }
     console.error(`[LibRu] GPT-4o-mini content extraction failed, using full text:`, err.message);
   }
 
@@ -988,8 +1066,9 @@ export async function generateTtsAudio(text, outputPath, options = {}) {
     throw new Error('OpenAI API key is required');
   }
 
-  // Estimate TTS time: ~1s per 200 chars (empirical), minimum 3s
-  const estimatedSeconds = Math.max(3, Math.round(text.length / 200));
+  // Over-estimate TTS time: ~1s per 70 chars (empirical: 2477 chars = 30s, 3432 chars = 48s)
+  // Better to reach ~70% and jump to 100% than hang at 95%
+  const estimatedSeconds = Math.max(5, Math.round(text.length / 70));
   console.log(`[TTS] Generating speech for ${text.length} chars (est. ${estimatedSeconds}s)...`);
 
   const heartbeat = createHeartbeat(

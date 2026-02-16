@@ -76,21 +76,12 @@ export function WordPopup({
 
   return (
     <>
-      {/* Backdrop to close popup */}
+      {/* Popup — absolutely positioned within scrollable container */}
       <div
-        className="fixed inset-0 z-40 cursor-pointer"
-        onClick={(e) => {
-          e.stopPropagation();
-          onClose();
-        }}
-      />
-
-      {/* Popup */}
-      <div
-        className="fixed z-50 bg-white rounded-lg shadow-lg border border-gray-200 p-4 min-w-48 max-w-xs"
+        className="absolute z-50 bg-white rounded-lg shadow-lg border border-gray-200 p-4 min-w-48 max-w-xs"
         style={{
-          left: Math.min(position.x, window.innerWidth - 220),
-          top: position.y + 10,
+          left: position.x,
+          top: position.y + 4,
         }}
       >
         {isLoading && (

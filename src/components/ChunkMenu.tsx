@@ -58,7 +58,7 @@ export function ChunkMenu({
             onClick={onReset}
             className="text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-100 px-3 py-1 rounded"
           >
-            {isText ? 'Different text' : 'Different video'}
+            Load different video or text
           </button>
         </div>
       </div>

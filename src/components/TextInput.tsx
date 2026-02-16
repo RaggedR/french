@@ -1,12 +1,12 @@
 import { useState } from 'react';
 
-interface VideoInputProps {
+interface TextInputProps {
   onSubmit: (url: string) => Promise<void>;
   isLoading: boolean;
   error: string | null;
 }
 
-export function VideoInput({ onSubmit, isLoading, error }: VideoInputProps) {
+export function TextInput({ onSubmit, isLoading, error }: TextInputProps) {
   const [url, setUrl] = useState('');
   const [validationError, setValidationError] = useState<string | null>(null);
 
@@ -14,8 +14,8 @@ export function VideoInput({ onSubmit, isLoading, error }: VideoInputProps) {
     e.preventDefault();
     const trimmed = url.trim();
     if (!trimmed || isLoading) return;
-    if (!trimmed.includes('ok.ru')) {
-      setValidationError('Only ok.ru video URLs are supported');
+    if (!trimmed.includes('lib.ru')) {
+      setValidationError('Only lib.ru text URLs are supported');
       return;
     }
     setValidationError(null);
@@ -25,14 +25,14 @@ export function VideoInput({ onSubmit, isLoading, error }: VideoInputProps) {
   return (
     <form onSubmit={handleSubmit} className="p-6 bg-white rounded-lg shadow-sm border border-gray-200 space-y-4">
       <div>
-        <h3 className="font-medium text-gray-900 mb-1">Video</h3>
-        <p className="text-xs text-gray-500">Transcribe a Russian video with synced subtitles</p>
+        <h3 className="font-medium text-gray-900 mb-1">Text</h3>
+        <p className="text-xs text-gray-500">Apply synced TTS to a Russian text</p>
       </div>
       <input
         type="url"
         value={url}
         onChange={(e) => { setUrl(e.target.value); setValidationError(null); }}
-        placeholder="https://ok.ru/video/..."
+        placeholder="https://lib.ru/..."
         className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
         disabled={isLoading}
       />
@@ -42,9 +42,9 @@ export function VideoInput({ onSubmit, isLoading, error }: VideoInputProps) {
       <button
         type="submit"
         disabled={!url.trim() || isLoading}
-        className="w-full px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        className="w-full px-4 py-2 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
       >
-        Transcribe Video
+        Load Text
       </button>
     </form>
   );

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { VideoInput } from './components/VideoInput';
+import { TextInput } from './components/TextInput';
 import { VideoPlayer } from './components/VideoPlayer';
 import { AudioPlayer } from './components/AudioPlayer';
 import { TranscriptPanel } from './components/TranscriptPanel';
@@ -115,6 +116,7 @@ function App() {
 
   // Content type (video or text)
   const [contentType, setContentType] = useState<ContentType>('video');
+  const contentTypeRef = useRef<ContentType>('video');
 
   // Current playback state (for active chunk)
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -184,97 +186,10 @@ function App() {
     };
   }, []);
 
-  const handleSelectChunk = useCallback(async (chunk: VideoChunk, sessionIdOverride?: string) => {
-    const activeSessionId = sessionIdOverride || sessionId;
-    if (!activeSessionId) {
-      console.error('[handleSelectChunk] No sessionId available');
-      setError('Session expired. Please analyze the video again.');
-      setView('input');
-      return;
-    }
-
-    console.log(`[handleSelectChunk] Selecting chunk ${chunk.id}, status: ${chunk.status}`);
-
-    // Clean up any existing SSE subscription
-    if (progressCleanupRef.current) {
-      progressCleanupRef.current();
-      progressCleanupRef.current = null;
-    }
-
-    // If chunk is already ready, fetch and play immediately
-    if (chunk.status === 'ready') {
-      console.log(`[handleSelectChunk] Chunk ready, fetching from GET /api/session/${activeSessionId}/chunk/${chunk.id}`);
-      try {
-        const data = await getChunk(activeSessionId, chunk.id);
-        console.log('[handleSelectChunk] Got chunk data:', { videoUrl: data.videoUrl?.slice(0, 50), audioUrl: data.audioUrl?.slice(0, 50), title: data.title });
-        setVideoUrl(data.videoUrl || null);
-        setAudioUrl(data.audioUrl || null);
-        setTranscript(data.transcript);
-        setVideoTitle(data.title);
-        setCurrentTime(0);
-        setCurrentChunkIndex(chunk.index);
-        setView('player');
-      } catch (err) {
-        console.error('[handleSelectChunk] Error fetching ready chunk:', err);
-        setError(err instanceof Error ? err.message : 'Failed to load chunk');
-        setView('chunk-menu');
-      }
-      return;
-    }
-
-    // Need to download the chunk
-    console.log(`[handleSelectChunk] Chunk not ready, downloading via POST /api/download-chunk`);
-    setLoadingChunkIndex(chunk.index);
-    setView('loading-chunk');
-    setError(null);
-    const isTextMode = contentType === 'text';
-    setProgress([
-      { type: isTextMode ? 'tts' : 'video', progress: 0, status: 'active', message: isTextMode ? 'Generating audio...' : 'Starting download...' },
-    ]);
-
-    // Subscribe to progress and wait for SSE connection before starting download
-    // This prevents race condition where progress events are lost
-    const connectedPromise = new Promise<void>((resolve) => {
-      const cleanup = subscribeToProgress(
-        activeSessionId,
-        (progressUpdate) => {
-          if (progressUpdate.type === 'video' || progressUpdate.type === 'tts' || progressUpdate.type === 'transcription' || progressUpdate.type === 'lemmatization') {
-            setProgress(prev => {
-              const existing = prev.find(p => p.type === progressUpdate.type);
-              if (existing) {
-                return prev.map(p => p.type === progressUpdate.type ? progressUpdate : p);
-              }
-              return [...prev, progressUpdate];
-            });
-          }
-        },
-        () => {
-          // Not used for chunk downloads
-        },
-        (errorMessage) => {
-          setError(errorMessage);
-          setView('chunk-menu');
-          setProgress([]);
-        },
-        () => resolve() // onConnected callback
-      );
-      progressCleanupRef.current = cleanup;
-    });
-
+  // Shared: load a chunk that's already ready (cached)
+  const loadReadyChunk = useCallback(async (activeSessionId: string, chunk: VideoChunk) => {
     try {
-      // Wait for SSE connection before starting download
-      await connectedPromise;
-      const data = await downloadChunk(activeSessionId, chunk.id);
-
-      // Update chunk status in local state
-      setSessionChunks(prev =>
-        prev.map(c =>
-          c.id === chunk.id
-            ? { ...c, status: 'ready' as const, videoUrl: data.videoUrl, audioUrl: data.audioUrl }
-            : c
-        )
-      );
-
+      const data = await getChunk(activeSessionId, chunk.id);
       setVideoUrl(data.videoUrl || null);
       setAudioUrl(data.audioUrl || null);
       setTranscript(data.transcript);
@@ -282,35 +197,174 @@ function App() {
       setCurrentTime(0);
       setCurrentChunkIndex(chunk.index);
       setView('player');
-      setProgress([]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load chunk');
+      setView('chunk-menu');
+    }
+  }, []);
+
+  // Shared: after a chunk finishes downloading, update state and show player
+  const finishChunkDownload = useCallback((chunk: VideoChunk, data: { videoUrl?: string; audioUrl?: string; transcript: any; title: string }) => {
+    setSessionChunks(prev =>
+      prev.map(c =>
+        c.id === chunk.id
+          ? { ...c, status: 'ready' as const, videoUrl: data.videoUrl, audioUrl: data.audioUrl }
+          : c
+      )
+    );
+    setVideoUrl(data.videoUrl || null);
+    setAudioUrl(data.audioUrl || null);
+    setTranscript(data.transcript);
+    setVideoTitle(data.title);
+    setCurrentTime(0);
+    setCurrentChunkIndex(chunk.index);
+    setView('player');
+    setProgress([]);
+  }, []);
+
+  const handleSelectVideoChunk = useCallback(async (chunk: VideoChunk, sessionIdOverride?: string) => {
+    const activeSessionId = sessionIdOverride || sessionId;
+    if (!activeSessionId) {
+      setError('Session expired. Please analyze the video again.');
+      setView('input');
+      return;
+    }
+
+    if (progressCleanupRef.current) {
+      progressCleanupRef.current();
+      progressCleanupRef.current = null;
+    }
+
+    if (chunk.status === 'ready') {
+      return loadReadyChunk(activeSessionId, chunk);
+    }
+
+    // Download video chunk — progress events: video
+    setLoadingChunkIndex(chunk.index);
+    setView('loading-chunk');
+    setError(null);
+    setProgress([
+      { type: 'video', progress: 0, status: 'active', message: 'Starting download...' },
+    ]);
+
+    const connectedPromise = new Promise<void>((resolve) => {
+      const cleanup = subscribeToProgress(
+        activeSessionId,
+        (update) => {
+          if (update.type === 'video' || update.type === 'lemmatization') {
+            setProgress(prev => {
+              const existing = prev.find(p => p.type === update.type);
+              if (existing) return prev.map(p => p.type === update.type ? update : p);
+              return [...prev, update];
+            });
+          }
+        },
+        () => {},
+        (errorMessage) => {
+          setError(errorMessage);
+          setView('chunk-menu');
+          setProgress([]);
+        },
+        () => resolve()
+      );
+      progressCleanupRef.current = cleanup;
+    });
+
+    try {
+      await connectedPromise;
+      const data = await downloadChunk(activeSessionId, chunk.id);
+      finishChunkDownload(chunk, data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to download chunk');
       setView('chunk-menu');
       setProgress([]);
     }
+  }, [sessionId, loadReadyChunk, finishChunkDownload]);
 
-  }, [sessionId, contentType]);
+  const handleSelectTextChunk = useCallback(async (chunk: VideoChunk, sessionIdOverride?: string) => {
+    const activeSessionId = sessionIdOverride || sessionId;
+    if (!activeSessionId) {
+      setError('Session expired. Please load the text again.');
+      setView('input');
+      return;
+    }
 
-  const handleAnalyze = useCallback(async (url: string) => {
-    // Don't delete previous session - keep it cached for 7 days in case user wants to re-watch
-    // GCS lifecycle policy handles cleanup of old sessions automatically
+    if (progressCleanupRef.current) {
+      progressCleanupRef.current();
+      progressCleanupRef.current = null;
+    }
 
-    const isText = url.includes('lib.ru');
-    setContentType(isText ? 'text' : 'video');
+    if (chunk.status === 'ready') {
+      return loadReadyChunk(activeSessionId, chunk);
+    }
+
+    // Generate TTS for text chunk — progress events: tts, lemmatization
+    setLoadingChunkIndex(chunk.index);
+    setView('loading-chunk');
+    setError(null);
+    setProgress([
+      { type: 'tts', progress: 0, status: 'active', message: 'Generating audio...' },
+    ]);
+
+    const connectedPromise = new Promise<void>((resolve) => {
+      const cleanup = subscribeToProgress(
+        activeSessionId,
+        (update) => {
+          if (update.type === 'tts' || update.type === 'lemmatization') {
+            setProgress(prev => {
+              const existing = prev.find(p => p.type === update.type);
+              if (existing) {
+                return prev.map(p => p.type === update.type ? update : p);
+              }
+              return [...prev, update];
+            });
+          }
+        },
+        () => {},
+        (errorMessage) => {
+          setError(errorMessage);
+          setView('chunk-menu');
+          setProgress([]);
+        },
+        () => resolve()
+      );
+      progressCleanupRef.current = cleanup;
+    });
+
+    try {
+      await connectedPromise;
+      const data = await downloadChunk(activeSessionId, chunk.id);
+      finishChunkDownload(chunk, data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to generate audio');
+      setView('chunk-menu');
+      setProgress([]);
+    }
+  }, [sessionId, loadReadyChunk, finishChunkDownload]);
+
+  // Dispatch to the right handler based on current content type
+  const handleSelectChunk = useCallback((chunk: VideoChunk, sessionIdOverride?: string) => {
+    if (contentTypeRef.current === 'text') {
+      return handleSelectTextChunk(chunk, sessionIdOverride);
+    }
+    return handleSelectVideoChunk(chunk, sessionIdOverride);
+  }, [handleSelectVideoChunk, handleSelectTextChunk]);
+
+  const handleAnalyzeVideo = useCallback(async (url: string) => {
+    setContentType('video');
+    contentTypeRef.current = 'video';
     setView('analyzing');
     setError(null);
     setOriginalUrl(url);
     setProgress([
-      { type: 'audio', progress: 0, status: 'active', message: isText ? 'Fetching text...' : 'Starting... (please wait)' },
+      { type: 'audio', progress: 0, status: 'active', message: 'Starting... (please wait)' },
     ]);
 
     try {
-      // Start analysis (backend uses env var for API key)
       interface AnalyzeResponse {
         sessionId: string;
         status: 'started' | 'cached';
         title?: string;
-        contentType?: ContentType;
         totalDuration?: number;
         chunks?: VideoChunk[];
         hasMoreChunks?: boolean;
@@ -324,71 +378,45 @@ function App() {
       const newSessionId = response.sessionId;
       setSessionId(newSessionId);
 
-      // If cached, skip progress updates and go straight to chunk menu
       if (response.status === 'cached' && response.chunks) {
-        console.log('[handleAnalyze] Using cached session:', newSessionId);
-        setContentType(response.contentType || 'video');
         setSessionTitle(response.title || 'Cached Video');
         setSessionTotalDuration(response.totalDuration || 0);
         setHasMoreChunks(response.hasMoreChunks || false);
-
         const chunksWithStatus = response.chunks.map(c => ({
-          ...c,
-          status: c.status || 'pending' as const,
-          videoUrl: c.videoUrl || null,
+          ...c, status: c.status || 'pending' as const, videoUrl: c.videoUrl || null,
         }));
         setSessionChunks(chunksWithStatus);
         setProgress([]);
 
-        // If only one chunk, auto-select it
         if (chunksWithStatus.length === 1 && !response.hasMoreChunks) {
-          setTimeout(() => {
-            handleSelectChunk(chunksWithStatus[0], newSessionId);
-          }, 0);
+          setTimeout(() => handleSelectVideoChunk(chunksWithStatus[0], newSessionId), 0);
         } else {
           setView('chunk-menu');
         }
         return;
       }
 
-      // Subscribe to progress updates for new analysis
       const cleanup = subscribeToProgress(
         newSessionId,
-        (progressUpdate) => {
-          setProgress((prev) => {
-            // Update or add progress for this type
-            const existing = prev.find((p) => p.type === progressUpdate.type);
-            if (existing) {
-              return prev.map((p) =>
-                p.type === progressUpdate.type ? progressUpdate : p
-              );
-            }
-            return [...prev, progressUpdate];
+        (update) => {
+          setProgress(prev => {
+            const existing = prev.find(p => p.type === update.type);
+            if (existing) return prev.map(p => p.type === update.type ? update : p);
+            return [...prev, update];
           });
         },
         (data) => {
-          // Analysis complete - store session info
-          setContentType(data.contentType || 'video');
           setSessionTitle(data.title);
           setSessionTotalDuration(data.totalDuration);
           setHasMoreChunks(data.hasMoreChunks);
-          // Add status to chunks from server response
           const chunksWithStatus = data.chunks.map(c => ({
-            ...c,
-            status: c.status || 'pending' as const,
-            videoUrl: c.videoUrl || null,
+            ...c, status: c.status || 'pending' as const, videoUrl: c.videoUrl || null,
           }));
           setSessionChunks(chunksWithStatus);
-
           setProgress([]);
 
-          // If only one chunk and no more to load, download directly; otherwise show menu
           if (chunksWithStatus.length === 1 && !data.hasMoreChunks) {
-            // Use setTimeout to avoid calling handleSelectChunk during render
-            // Pass newSessionId explicitly since state might not be updated yet
-            setTimeout(() => {
-              handleSelectChunk(chunksWithStatus[0], newSessionId);
-            }, 0);
+            setTimeout(() => handleSelectVideoChunk(chunksWithStatus[0], newSessionId), 0);
           } else {
             setView('chunk-menu');
           }
@@ -399,14 +427,98 @@ function App() {
           setProgress([]);
         }
       );
-
       progressCleanupRef.current = cleanup;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to analyze video');
       setView('input');
       setProgress([]);
     }
-  }, [handleSelectChunk]);
+  }, [handleSelectVideoChunk]);
+
+  const handleAnalyzeText = useCallback(async (url: string) => {
+    setContentType('text');
+    contentTypeRef.current = 'text';
+    setView('analyzing');
+    setError(null);
+    setOriginalUrl(url);
+    setProgress([
+      { type: 'audio', progress: 0, status: 'active', message: 'Fetching text...' },
+    ]);
+
+    try {
+      interface AnalyzeResponse {
+        sessionId: string;
+        status: 'started' | 'cached';
+        title?: string;
+        totalDuration?: number;
+        chunks?: VideoChunk[];
+        hasMoreChunks?: boolean;
+      }
+
+      const response = await apiRequest<AnalyzeResponse>('/api/analyze', {
+        method: 'POST',
+        body: JSON.stringify({ url }),
+      });
+
+      const newSessionId = response.sessionId;
+      setSessionId(newSessionId);
+
+      if (response.status === 'cached' && response.chunks) {
+        setSessionTitle(response.title || 'Cached Text');
+        setSessionTotalDuration(response.totalDuration || 0);
+        setHasMoreChunks(response.hasMoreChunks || false);
+        const chunksWithStatus = response.chunks.map(c => ({
+          ...c, status: c.status || 'pending' as const, videoUrl: c.videoUrl || null,
+        }));
+        setSessionChunks(chunksWithStatus);
+        setProgress([]);
+
+        if (chunksWithStatus.length === 1 && !response.hasMoreChunks) {
+          setTimeout(() => handleSelectTextChunk(chunksWithStatus[0], newSessionId), 0);
+        } else {
+          setView('chunk-menu');
+        }
+        return;
+      }
+
+      const cleanup = subscribeToProgress(
+        newSessionId,
+        (update) => {
+          setProgress(prev => {
+            const existing = prev.find(p => p.type === update.type);
+            if (existing) return prev.map(p => p.type === update.type ? update : p);
+            return [...prev, update];
+          });
+        },
+        (data) => {
+          setSessionTitle(data.title);
+          setSessionTotalDuration(data.totalDuration);
+          setHasMoreChunks(data.hasMoreChunks);
+          const chunksWithStatus = data.chunks.map(c => ({
+            ...c, status: c.status || 'pending' as const, videoUrl: c.videoUrl || null,
+          }));
+          setSessionChunks(chunksWithStatus);
+          setProgress([]);
+
+          if (chunksWithStatus.length === 1 && !data.hasMoreChunks) {
+            setTimeout(() => handleSelectTextChunk(chunksWithStatus[0], newSessionId), 0);
+          } else {
+            setView('chunk-menu');
+          }
+        },
+        (errorMessage) => {
+          setError(errorMessage);
+          setView('input');
+          setProgress([]);
+        }
+      );
+      progressCleanupRef.current = cleanup;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load text');
+      setView('input');
+      setProgress([]);
+    }
+  }, [handleSelectTextChunk]);
 
   const handleBackToChunks = useCallback(async () => {
     // Refresh session state from backend to get latest chunk statuses
@@ -506,6 +618,7 @@ function App() {
 
     setView('input');
     setContentType('video');
+    contentTypeRef.current = 'video';
     setSessionId(null);
     setSessionTitle('');
     setSessionTotalDuration(0);
@@ -576,11 +689,10 @@ function App() {
                 Paste a video or text URL to get a synced transcript with click-to-translate
               </p>
             </div>
-            <VideoInput
-              onTranscribe={handleAnalyze}
-              isLoading={false}
-              error={error}
-            />
+            <div className="max-w-2xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
+              <VideoInput onSubmit={handleAnalyzeVideo} isLoading={false} error={error} />
+              <TextInput onSubmit={handleAnalyzeText} isLoading={false} error={error} />
+            </div>
           </div>
         )}
 
@@ -618,6 +730,16 @@ function App() {
         {/* Chunk menu view */}
         {view === 'chunk-menu' && sessionChunks.length > 0 && (
           <div className="space-y-6">
+            {error && (
+              <div className="max-w-md mx-auto p-4 bg-red-50 border border-red-200 rounded-lg">
+                <p className="text-red-700 text-sm" dangerouslySetInnerHTML={{
+                  __html: error.replace(
+                    /(https:\/\/[^\s]+)/g,
+                    '<a href="$1" target="_blank" rel="noopener noreferrer" class="underline font-medium hover:text-red-900">$1</a>'
+                  )
+                }} />
+              </div>
+            )}
             <ChunkMenu
               title={sessionTitle}
               totalDuration={sessionTotalDuration}
@@ -721,7 +843,7 @@ function App() {
                   onClick={handleReset}
                   className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-100 rounded-md"
                 >
-                  {contentType === 'text' ? 'Load different text' : 'Load different video'}
+                  Load different video or text
                 </button>
               </div>
             </div>

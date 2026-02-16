@@ -1075,7 +1075,7 @@ app.post('/api/analyze', async (req, res) => {
 
       // ── Video mode (ok.ru) ──
       // Fast info fetch via HTML scraping (~4-5s vs yt-dlp's ~15s)
-      sendProgress(sessionId, 'audio', 1, 'active', 'Fetching video info...');
+      // audio progress is managed by downloadAudioChunk via onProgress callback
 
       let title, totalDuration;
       try {
@@ -1102,7 +1102,7 @@ app.post('/api/analyze', async (req, res) => {
       }
 
       // Now download audio (yt-dlp will get duration if we didn't)
-      sendProgress(sessionId, 'audio', 5, 'active', 'Downloading audio...');
+      // audio progress is managed by downloadAudioChunk via onProgress callback
       const audioPath = path.join(tempDir, `audio_${sessionId}_batch0.mp3`);
       const infoJsonPath = path.join(tempDir, `audio_${sessionId}_batch0.mp3.info.json`);
       const onProgress = createProgressCallback(sessionId);
@@ -1146,10 +1146,9 @@ app.post('/api/analyze', async (req, res) => {
       const rawTranscript = await transcribeAudioChunk(audioPath, { onProgress });
 
       // Add punctuation via LLM
-      const punctuatedTranscript = await addPunctuation(rawTranscript, { onProgress });
+      const fullBatchTranscript = await addPunctuation(rawTranscript, { onProgress });
 
-      // Lemmatize words for frequency matching
-      const fullBatchTranscript = await lemmatizeWords(punctuatedTranscript, { onProgress });
+      // Lemmatization deferred to per-chunk download (faster on ~3min chunks vs full 15min)
 
       // Clean up audio file
       fs.unlinkSync(audioPath);
@@ -1282,10 +1281,9 @@ app.post('/api/load-more-chunks', async (req, res) => {
     const rawTranscriptUnpunctuated = await transcribeAudioChunk(audioPath, { onProgress });
 
     // Add punctuation via LLM
-    const punctuatedTranscript = await addPunctuation(rawTranscriptUnpunctuated, { onProgress });
+    const rawTranscript = await addPunctuation(rawTranscriptUnpunctuated, { onProgress });
 
-    // Lemmatize words for frequency matching
-    const rawTranscript = await lemmatizeWords(punctuatedTranscript, { onProgress });
+    // Lemmatization deferred to per-chunk download
 
     // Clean up audio
     fs.unlinkSync(audioPath);
@@ -1354,7 +1352,7 @@ app.post('/api/load-more-chunks', async (req, res) => {
     }
 
     sendProgress(sessionId, 'error', 0, 'error', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: friendlyErrorMessage(error.message) });
   }
 });
 
@@ -1491,7 +1489,18 @@ function printProgress(sessionId, type, progress, status, message) {
 /**
  * Send progress update to all connected clients for a session
  */
+/**
+ * Rewrite known API error messages into user-friendly versions with actionable links.
+ */
+function friendlyErrorMessage(message) {
+  if (message && message.includes('exceeded your current quota')) {
+    return 'OpenAI API quota exceeded. Add credits at https://platform.openai.com/settings/organization/billing';
+  }
+  return message;
+}
+
 function sendProgress(sessionId, type, progress, status, message, extra = {}) {
+  if (status === 'error') message = friendlyErrorMessage(message);
   // Print to terminal
   printProgress(sessionId, type, progress, status, message);
 
@@ -1612,12 +1621,13 @@ app.post('/api/download-chunk', async (req, res) => {
     return res.status(404).json({ error: 'Chunk not found' });
   }
 
-  // If already ready, return cached data
-  if (chunk.status === 'ready' && chunk.videoUrl) {
+  // If already ready, return cached data (videoUrl for video mode, audioUrl for text mode)
+  if (chunk.status === 'ready' && (chunk.videoUrl || chunk.audioUrl)) {
     const transcript = session.chunkTranscripts.get(chunkId);
     const partNum = parseInt(chunkId.split('-')[1]) + 1;
     return res.json({
       videoUrl: chunk.videoUrl,
+      audioUrl: chunk.audioUrl,
       transcript,
       title: `${session.title} - Part ${partNum}`,
     });
@@ -1632,10 +1642,11 @@ app.post('/api/download-chunk', async (req, res) => {
     const startWait = Date.now();
     while (Date.now() - startWait < maxWait) {
       await new Promise(r => setTimeout(r, pollInterval));
-      if (chunk.status === 'ready' && chunk.videoUrl) {
+      if (chunk.status === 'ready' && (chunk.videoUrl || chunk.audioUrl)) {
         const transcript = session.chunkTranscripts.get(chunkId);
         return res.json({
           videoUrl: chunk.videoUrl,
+          audioUrl: chunk.audioUrl,
           transcript,
           title: `${session.title} - Part ${partNum}`,
         });
@@ -1719,8 +1730,9 @@ app.post('/api/download-chunk', async (req, res) => {
       console.error(`[Download-Chunk] Text mode error:`, error);
       chunk.status = 'pending';
       if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-      sendProgress(sessionId, 'tts', 0, 'error', error.message);
-      return res.status(500).json({ error: error.message });
+      const msg = friendlyErrorMessage(error.message);
+      sendProgress(sessionId, 'tts', 0, 'error', msg);
+      return res.status(500).json({ error: msg });
     }
   }
 
@@ -1757,8 +1769,9 @@ app.post('/api/download-chunk', async (req, res) => {
       fs.unlinkSync(cachedInfoPath);
     }
 
-    // Get chunk transcript with adjusted timestamps
-    const chunkTranscript = getChunkTranscript(session.transcript, startTime, endTime);
+    // Get chunk transcript with adjusted timestamps, then lemmatize per-chunk
+    const rawChunkTranscript = getChunkTranscript(session.transcript, startTime, endTime);
+    const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress });
     console.log(`[Download-Chunk] Chunk ${chunkId}: startTime=${startTime}, endTime=${endTime}`);
     console.log(`[Download-Chunk] Full transcript has ${session.transcript.words?.length} words`);
     console.log(`[Download-Chunk] Chunk transcript has ${chunkTranscript.words?.length} words`);
@@ -1768,7 +1781,7 @@ app.post('/api/download-chunk', async (req, res) => {
     let videoUrl;
     if (!IS_LOCAL && bucket) {
       // Upload to GCS
-      sendProgress(sessionId, 'video', 90, 'active', 'Uploading...');
+      sendProgress(sessionId, 'video', 95, 'active', 'Uploading to cloud...');
       const gcsFileName = `videos/${sessionId}_${chunkId}.mp4`;
       await bucket.upload(chunkPath, {
         destination: gcsFileName,
@@ -1821,7 +1834,7 @@ app.post('/api/download-chunk', async (req, res) => {
     if (fs.existsSync(chunkPath)) fs.unlinkSync(chunkPath);
 
     sendProgress(sessionId, 'video', 0, 'error', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: friendlyErrorMessage(error.message) });
   }
 });
 
@@ -1913,8 +1926,9 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
       fs.unlinkSync(cachedInfoPath);
     }
 
-    // Get transcript
-    const chunkTranscript = getChunkTranscript(session.transcript, startTime, endTime);
+    // Get transcript and lemmatize per-chunk
+    const rawChunkTranscript = getChunkTranscript(session.transcript, startTime, endTime);
+    const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress: () => {} });
 
     // Upload to GCS
     let videoUrl;

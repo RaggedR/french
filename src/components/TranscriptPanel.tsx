@@ -137,6 +137,11 @@ export function TranscriptPanel({
             break;
           }
         }
+        // If no punctuation boundaries found, use a window of ~10 words around the clicked word
+        if (sentenceStart === 0 && sentenceEnd === words.length - 1 && words.length > 20) {
+          sentenceStart = Math.max(0, clickedIdx - 5);
+          sentenceEnd = Math.min(words.length - 1, clickedIdx + 5);
+        }
         const sentence = words.slice(sentenceStart, sentenceEnd + 1)
           .map(w => w.word)
           .join('')
@@ -148,7 +153,12 @@ export function TranscriptPanel({
 
       // Show translation popup
       setSelectedWord(word);
-      setPopupPosition({ x: event.clientX, y: event.clientY });
+      // Position directly below the clicked word using its offset within the container
+      const el = event.target as HTMLElement;
+      setPopupPosition({
+        x: el.offsetLeft,
+        y: el.offsetTop + el.offsetHeight,
+      });
       setTranslation(null);
       setTranslationError(null);
       setIsTranslating(true);
@@ -200,7 +210,11 @@ export function TranscriptPanel({
     <div className="relative">
       <div
         ref={containerRef}
-        className="h-[400px] overflow-y-auto p-4 text-lg leading-relaxed"
+        className="h-[400px] overflow-y-auto p-4 text-lg leading-relaxed relative"
+        onClick={(e) => {
+          // Close popup when clicking on the container background (not on a word)
+          if (e.target === e.currentTarget) handleClosePopup();
+        }}
       >
         {transcript.words.map((word, index) => {
           const isCurrentWord = index === currentWordIndex;
@@ -226,9 +240,8 @@ export function TranscriptPanel({
             </span>
           );
         })}
-      </div>
 
-      {/* Word popup */}
+      {/* Word popup — inside scrollable container so it scrolls with text */}
       <WordPopup
         translation={translation}
         isLoading={isTranslating}
@@ -239,6 +252,7 @@ export function TranscriptPanel({
         isInDeck={selectedWord ? isWordInDeck?.(selectedWord.word) : false}
         context={selectedContext}
       />
+      </div>
 
       {/* Progress indicator */}
       <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-200">

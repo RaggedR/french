@@ -3,12 +3,12 @@ import { getAuth } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
 
 const firebaseConfig = {
-  apiKey: 'AIzaSyBh1z56FhbZCcPvNVkzQbEyFBZF-tJ27dE',
-  authDomain: 'book-friend-finder.firebaseapp.com',
-  projectId: 'book-friend-finder',
-  storageBucket: 'book-friend-finder.firebasestorage.app',
-  messagingSenderId: '770103525576',
-  appId: '1:770103525576:web:3a205d26183090ae71a5fd',
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
 const app = initializeApp(firebaseConfig);
