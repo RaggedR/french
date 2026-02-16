@@ -304,9 +304,9 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
 
                 {/* Front: Russian word + pronunciation + Russian sentence */}
                 <div className="text-center mb-4">
-                  <p className="text-3xl font-medium text-gray-900 mb-3">{currentItem.card.word}</p>
+                  <p className="text-3xl font-medium text-gray-900 mb-3">{currentItem.card.translation}</p>
                   <button
-                    onClick={() => speak(currentItem.card.word, currentItem.card.sourceLanguage)}
+                    onClick={() => speak(currentItem.card.translation, currentItem.card.sourceLanguage)}
                     className="text-gray-400 hover:text-blue-600 transition-colors"
                     title="Listen"
                   >
@@ -317,9 +317,9 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
                   </button>
                 </div>
 
-                {currentItem.card.context && (
+                {currentItem.card.contextTranslation && (
                   <div className="text-center mb-6 px-4">
-                    <ContextSentence context={currentItem.card.context} word={currentItem.card.word} />
+                    <ContextSentence context={currentItem.card.contextTranslation} word={currentItem.card.translation} />
                   </div>
                 )}
 
@@ -337,12 +337,12 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
                   <div>
                     {/* Back: English translation + English sentence */}
                     <div className="text-center mb-4 pb-4 border-t pt-4">
-                      <p className="text-xl text-gray-700 mb-2">{currentItem.card.translation}</p>
+                      <p className="text-xl text-gray-700 mb-2">{currentItem.card.word}</p>
                     </div>
 
-                    {currentItem.card.contextTranslation && (
+                    {currentItem.card.context && (
                       <div className="text-center mb-6 px-4">
-                        <ContextSentence context={currentItem.card.contextTranslation} word={currentItem.card.translation} />
+                        <ContextSentence context={currentItem.card.context} word={currentItem.card.word} />
                       </div>
                     )}
 

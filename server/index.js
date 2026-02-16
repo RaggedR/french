@@ -666,6 +666,55 @@ app.post('/api/translate', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/extract-sentence
+ * Uses GPT to extract the single sentence containing a word from surrounding text,
+ * and translates it to English.
+ * Accepts: { text: string, word: string }
+ * Returns: { sentence: string, translation: string }
+ */
+app.post('/api/extract-sentence', async (req, res) => {
+  const { text, word } = req.body;
+
+  if (!text || !word) {
+    return res.status(400).json({ error: 'text and word are required' });
+  }
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{
+          role: 'system',
+          content: 'From the given Russian text, extract the single complete sentence that contains the specified word. Return JSON with two fields: "sentence" (the Russian sentence) and "translation" (its English translation). The sentence should be exactly one grammatical sentence, not a fragment and not multiple sentences.',
+        }, {
+          role: 'user',
+          content: `Word: ${word}\nText: ${text}`,
+        }],
+        response_format: { type: 'json_object' },
+        temperature: 0,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error?.message || 'Sentence extraction failed');
+    }
+
+    const data = await response.json();
+    const result = JSON.parse(data.choices[0].message.content);
+    res.json({ sentence: result.sentence, translation: result.translation });
+  } catch (error) {
+    console.error('[ExtractSentence] Error:', error);
+    res.status(500).json({ error: error.message || 'Sentence extraction failed' });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });

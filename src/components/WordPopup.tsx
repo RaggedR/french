@@ -51,19 +51,21 @@ export function WordPopup({
     if (!translation || !onAddToDeck) return;
     setIsAddingToDeck(true);
     try {
-      // Translate the context sentence if we have one
+      let sentence: string | undefined;
       let contextTranslation: string | undefined;
       if (context) {
-        const data = await apiRequest<Translation>('/api/translate', {
+        // Ask GPT to extract the exact sentence and translate it
+        const data = await apiRequest<{ sentence: string; translation: string }>('/api/extract-sentence', {
           method: 'POST',
-          body: JSON.stringify({ word: context }),
+          body: JSON.stringify({ text: context, word: translation.word }),
         });
+        sentence = data.sentence;
         contextTranslation = data.translation;
       }
-      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, context, contextTranslation);
+      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, sentence, contextTranslation);
     } catch {
-      // Still add without sentence translation if it fails
-      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, context);
+      // Still add without sentence if extraction fails
+      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage);
     } finally {
       setIsAddingToDeck(false);
     }

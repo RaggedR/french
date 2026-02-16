@@ -113,40 +113,19 @@ export function TranscriptPanel({
         return;
       }
 
-      // Extract the sentence containing this word by scanning for punctuation
-      // in the words array. GPT-4o already attached punctuation to each word
-      // (e.g. "привет." or "сказал,"), so we find sentence boundaries by
-      // looking for words ending in . ! ? or …
+      // Grab a window of ~30 words around the clicked word as raw context.
+      // The LLM will extract the exact sentence when adding to deck.
       const words = transcript.words;
       const clickedIdx = words.indexOf(word);
       if (clickedIdx >= 0) {
-        const endsPunctuation = /[.!?…]$/;
-        // Scan backward to find sentence start (word after previous sentence-ender)
-        let sentenceStart = 0;
-        for (let i = clickedIdx - 1; i >= 0; i--) {
-          if (endsPunctuation.test(words[i].word.trim())) {
-            sentenceStart = i + 1;
-            break;
-          }
-        }
-        // Scan forward to find sentence end (first word with sentence-ending punctuation)
-        let sentenceEnd = words.length - 1;
-        for (let i = clickedIdx; i < words.length; i++) {
-          if (endsPunctuation.test(words[i].word.trim())) {
-            sentenceEnd = i;
-            break;
-          }
-        }
-        // If no punctuation boundaries found, use a window of ~10 words around the clicked word
-        if (sentenceStart === 0 && sentenceEnd === words.length - 1 && words.length > 20) {
-          sentenceStart = Math.max(0, clickedIdx - 5);
-          sentenceEnd = Math.min(words.length - 1, clickedIdx + 5);
-        }
-        const sentence = words.slice(sentenceStart, sentenceEnd + 1)
+        const WINDOW = 15;
+        const start = Math.max(0, clickedIdx - WINDOW);
+        const end = Math.min(words.length - 1, clickedIdx + WINDOW);
+        const context = words.slice(start, end + 1)
           .map(w => w.word)
           .join('')
           .trim();
-        setSelectedContext(sentence || undefined);
+        setSelectedContext(context || undefined);
       } else {
         setSelectedContext(undefined);
       }
