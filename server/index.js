@@ -1269,7 +1269,8 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
 
       // Transcribe audio
       const rawTranscript = await transcribeAudioChunk(audioPath, { onProgress });
-      trackCost(uid, costs.whisper(downloadEndTime));
+      const audioDurationSec = downloadEndTime; // equals duration since download starts at 0
+      trackCost(uid, costs.whisper(audioDurationSec));
 
       // Add punctuation via LLM
       const fullBatchTranscript = await addPunctuation(rawTranscript, { onProgress });
