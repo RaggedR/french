@@ -62,6 +62,9 @@ const fetchMock = vi.fn(async (url, opts) => {
   return originalFetch(url, opts);
 });
 
+let server;
+let baseUrl;
+
 beforeAll(async () => {
   // Use vi.stubGlobal to properly intercept Node 20's built-in fetch
   vi.stubGlobal('fetch', fetchMock);
@@ -70,21 +73,33 @@ beforeAll(async () => {
   process.env.OPENAI_API_KEY = 'test-key';
   process.env.GOOGLE_TRANSLATE_API_KEY = 'test-key';
 
-  // Import server (starts Express)
-  const mod = await import('./index.js');
-  global.__server = mod.default;
+  // Import the Express app (does NOT auto-listen when imported)
+  const { app } = await import('./index.js');
+
+  // Start server on a random available port
+  await new Promise((resolve) => {
+    server = app.listen(0, () => {
+      const { port } = server.address();
+      baseUrl = `http://127.0.0.1:${port}`;
+      resolve();
+    });
+  });
 });
 
 afterAll(() => {
   vi.restoreAllMocks();
-  if (global.__server?.close) global.__server.close();
+  return new Promise((resolve) => {
+    if (server) server.close(resolve);
+    else resolve();
+  });
 });
 
 function post(path, body) {
+  const url = new URL(path, baseUrl);
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request(
-      { hostname: 'localhost', port: 3001, path, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } },
+      { hostname: url.hostname, port: url.port, path, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } },
       (res) => {
         let body = '';
         res.on('data', (c) => (body += c));
