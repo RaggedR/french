@@ -5,7 +5,6 @@ export interface Translation {
 }
 
 export interface TranslatorConfig {
-  googleApiKey?: string;
   freqRangeMin?: number;  // minimum frequency rank to underline (e.g., 500)
   freqRangeMax?: number;  // maximum frequency rank to underline (e.g., 1000)
 }

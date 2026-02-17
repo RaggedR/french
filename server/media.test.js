@@ -1,5 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createHeartbeat, editDistance, isFuzzyMatch, stripPunctuation } from './media.js';
+import {
+  createHeartbeat, editDistance, isFuzzyMatch, stripPunctuation,
+  isLibRuUrl, estimateWordTimestamps, alignWhisperToOriginal, addPunctuation,
+} from './media.js';
+
+// Shared mock for OpenAI chat.completions.create — vi.hoisted runs before vi.mock
+const { mockChatCreate } = vi.hoisted(() => ({
+  mockChatCreate: vi.fn(),
+}));
+
+vi.mock('openai', () => ({
+  default: class MockOpenAI {
+    constructor() {}
+    chat = { completions: { create: mockChatCreate } };
+  },
+}));
 
 describe('createHeartbeat', () => {
   beforeEach(() => {
@@ -291,5 +306,318 @@ describe('isFuzzyMatch', () => {
 
   it('is symmetric', () => {
     expect(isFuzzyMatch('пограмма', 'программа')).toBe(isFuzzyMatch('программа', 'пограмма'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isLibRuUrl
+// ---------------------------------------------------------------------------
+
+describe('isLibRuUrl', () => {
+  it('returns true for lib.ru hostname', () => {
+    expect(isLibRuUrl('https://lib.ru/PROZA/some-text.html')).toBe(true);
+  });
+
+  it('returns true for subdomain of lib.ru', () => {
+    expect(isLibRuUrl('https://az.lib.ru/p/pushkin/text.html')).toBe(true);
+  });
+
+  it('returns false for non-lib.ru URLs', () => {
+    expect(isLibRuUrl('https://ok.ru/video/123')).toBe(false);
+    expect(isLibRuUrl('https://youtube.com/watch?v=abc')).toBe(false);
+  });
+
+  it('returns false for lib.ru appearing in path but not hostname', () => {
+    expect(isLibRuUrl('https://example.com/lib.ru/page')).toBe(false);
+  });
+
+  it('returns false for invalid URLs', () => {
+    expect(isLibRuUrl('not-a-url')).toBe(false);
+    expect(isLibRuUrl('')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// estimateWordTimestamps
+// ---------------------------------------------------------------------------
+
+describe('estimateWordTimestamps', () => {
+  it('distributes duration proportionally to word character length', () => {
+    const result = estimateWordTimestamps('aa bbbb', 3);
+    // "aa" = 2 chars, "bbbb" = 4 chars, total = 6 chars
+    // "aa" gets 2/6 * 3 = 1s, "bbbb" gets 4/6 * 3 = 2s
+    expect(result.words).toHaveLength(2);
+    expect(result.words[0].word).toBe('aa');
+    expect(result.words[0].start).toBeCloseTo(0, 5);
+    expect(result.words[0].end).toBeCloseTo(1, 5);
+    expect(result.words[1].word).toBe(' bbbb');
+    expect(result.words[1].start).toBeCloseTo(1, 5);
+    expect(result.words[1].end).toBeCloseTo(3, 5);
+  });
+
+  it('adds leading space to all words except the first', () => {
+    const result = estimateWordTimestamps('один два три', 10);
+    expect(result.words[0].word).toBe('один');
+    expect(result.words[1].word).toBe(' два');
+    expect(result.words[2].word).toBe(' три');
+  });
+
+  it('timestamps cover the full duration with no gaps', () => {
+    const result = estimateWordTimestamps('один два три четыре пять', 100);
+    // First word starts at 0
+    expect(result.words[0].start).toBe(0);
+    // Last word ends at duration
+    const lastWord = result.words[result.words.length - 1];
+    expect(lastWord.end).toBeCloseTo(100, 5);
+  });
+
+  it('builds segments of ~20 words each', () => {
+    // Create text with 45 words
+    const words = Array.from({ length: 45 }, (_, i) => `слово${i}`);
+    const result = estimateWordTimestamps(words.join(' '), 90);
+    // 45 words / 20 per segment = 3 segments (20, 20, 5)
+    expect(result.segments).toHaveLength(3);
+    expect(result.segments[0].start).toBe(0);
+    expect(result.segments[2].end).toBeCloseTo(90, 5);
+  });
+
+  it('returns language ru and input duration', () => {
+    const result = estimateWordTimestamps('привет мир', 42);
+    expect(result.language).toBe('ru');
+    expect(result.duration).toBe(42);
+  });
+
+  it('handles single word', () => {
+    const result = estimateWordTimestamps('привет', 5);
+    expect(result.words).toHaveLength(1);
+    expect(result.words[0].start).toBe(0);
+    expect(result.words[0].end).toBe(5);
+    expect(result.words[0].word).toBe('привет');
+  });
+
+  it('ignores extra whitespace', () => {
+    const result = estimateWordTimestamps('  один   два  ', 10);
+    expect(result.words).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// alignWhisperToOriginal
+// ---------------------------------------------------------------------------
+
+describe('alignWhisperToOriginal', () => {
+  it('aligns matching words using Whisper timestamps', () => {
+    const whisper = [
+      { word: ' привет', start: 0.5, end: 1.0 },
+      { word: ' мир', start: 1.0, end: 1.5 },
+    ];
+    const original = ['Привет,', 'мир!'];
+    const result = alignWhisperToOriginal(whisper, original);
+    // Uses original word text with Whisper timing
+    expect(result[0].word).toBe('Привет,');
+    expect(result[0].start).toBe(0.5);
+    expect(result[0].end).toBe(1.0);
+    expect(result[1].word).toBe(' мир!');
+    expect(result[1].start).toBe(1.0);
+    expect(result[1].end).toBe(1.5);
+  });
+
+  it('handles empty whisper words → all get zero timestamps', () => {
+    const result = alignWhisperToOriginal([], ['один', 'два']);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toEqual({ word: 'один', start: 0, end: 0 });
+    expect(result[1]).toEqual({ word: ' два', start: 0, end: 0 });
+  });
+
+  it('handles empty original words → empty result', () => {
+    const whisper = [{ word: ' привет', start: 0, end: 1 }];
+    const result = alignWhisperToOriginal(whisper, []);
+    expect(result).toHaveLength(0);
+  });
+
+  it('skips extra whisper words via lookahead', () => {
+    // Whisper has an extra word "ну" that original doesn't have
+    const whisper = [
+      { word: ' ну', start: 0, end: 0.5 },
+      { word: ' привет', start: 0.5, end: 1.0 },
+      { word: ' мир', start: 1.0, end: 1.5 },
+    ];
+    const original = ['Привет,', 'мир.'];
+    const result = alignWhisperToOriginal(whisper, original);
+    // "Привет" should match whisper word at index 1 via lookahead
+    expect(result[0].word).toBe('Привет,');
+    expect(result[0].start).toBe(0.5);
+    expect(result[1].word).toBe(' мир.');
+    expect(result[1].start).toBe(1.0);
+  });
+
+  it('interpolates timestamps for unmatched original words', () => {
+    // Original has words that Whisper didn't transcribe
+    const whisper = [
+      { word: ' привет', start: 0, end: 1.0 },
+      { word: ' мир', start: 4.0, end: 5.0 },
+    ];
+    // "красивый" is between matched words → should be interpolated
+    const original = ['Привет,', 'красивый', 'мир!'];
+    const result = alignWhisperToOriginal(whisper, original);
+    expect(result).toHaveLength(3);
+    // "красивый" should have interpolated timestamps between 1.0 and 4.0
+    expect(result[1].start).toBeGreaterThan(1.0);
+    expect(result[1].start).toBeLessThan(4.0);
+  });
+
+  it('marks remaining original words for interpolation when whisper runs out', () => {
+    const whisper = [
+      { word: ' привет', start: 0, end: 1.0 },
+    ];
+    const original = ['Привет,', 'мир!', 'Как', 'дела?'];
+    const result = alignWhisperToOriginal(whisper, original);
+    expect(result).toHaveLength(4);
+    // First word matched
+    expect(result[0].start).toBe(0);
+    // Remaining words get interpolated (not -1 after interpolation pass)
+    expect(result[3].start).toBeGreaterThanOrEqual(0);
+  });
+
+  it('uses fuzzy matching for spelling corrections', () => {
+    const whisper = [
+      { word: ' пограмма', start: 0, end: 1.0 },  // misspelled
+    ];
+    const original = ['программа'];
+    const result = alignWhisperToOriginal(whisper, original);
+    // Should fuzzy-match and use original text with Whisper timing
+    expect(result[0].word).toBe('программа');
+    expect(result[0].start).toBe(0);
+    expect(result[0].end).toBe(1.0);
+  });
+
+  it('adds leading space to all words after the first', () => {
+    const whisper = [
+      { word: 'раз', start: 0, end: 1 },
+      { word: ' два', start: 1, end: 2 },
+      { word: ' три', start: 2, end: 3 },
+    ];
+    const original = ['Раз', 'два', 'три'];
+    const result = alignWhisperToOriginal(whisper, original);
+    expect(result[0].word).toBe('Раз');
+    expect(result[1].word).toBe(' два');
+    expect(result[2].word).toBe(' три');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// addPunctuation (mocked OpenAI)
+// ---------------------------------------------------------------------------
+
+describe('addPunctuation', () => {
+  beforeEach(() => {
+    mockChatCreate.mockReset();
+  });
+
+  it('returns transcript unchanged when no words', async () => {
+    const transcript = { words: [], segments: [], language: 'ru', duration: 10 };
+    const result = await addPunctuation(transcript, { apiKey: 'test-key' });
+    expect(result).toEqual(transcript);
+  });
+
+  it('returns transcript unchanged when no API key', async () => {
+    const transcript = {
+      words: [{ word: ' привет', start: 0, end: 1 }],
+      segments: [],
+      language: 'ru',
+      duration: 1,
+    };
+    const result = await addPunctuation(transcript, { apiKey: '' });
+    expect(result).toEqual(transcript);
+  });
+
+  it('applies punctuation from GPT-4o response via two-pointer alignment', async () => {
+    mockChatCreate.mockResolvedValue({
+      choices: [{ message: { content: 'Привет, мир!' } }],
+    });
+
+    const transcript = {
+      words: [
+        { word: ' привет', start: 0, end: 0.5 },
+        { word: ' мир', start: 0.5, end: 1.0 },
+      ],
+      segments: [{ text: 'привет мир', start: 0, end: 1.0 }],
+      language: 'ru',
+      duration: 1.0,
+    };
+
+    const onProgress = vi.fn();
+    const result = await addPunctuation(transcript, { apiKey: 'test-key', onProgress });
+
+    // Words should have punctuation applied
+    expect(result.words[0].word).toBe(' Привет,');
+    expect(result.words[1].word).toBe(' мир!');
+    // Timestamps preserved
+    expect(result.words[0].start).toBe(0);
+    expect(result.words[0].end).toBe(0.5);
+  });
+
+  it('falls back to original words on API error', async () => {
+    mockChatCreate.mockRejectedValue(new Error('API Error'));
+
+    const transcript = {
+      words: [
+        { word: ' привет', start: 0, end: 0.5 },
+        { word: ' мир', start: 0.5, end: 1.0 },
+      ],
+      segments: [{ text: 'привет мир', start: 0, end: 1.0 }],
+      language: 'ru',
+      duration: 1.0,
+    };
+
+    const result = await addPunctuation(transcript, { apiKey: 'test-key' });
+
+    // Should fall back to original words
+    expect(result.words[0].word).toBe(' привет');
+    expect(result.words[1].word).toBe(' мир');
+  });
+
+  it('handles GPT inserting extra tokens via lookahead', async () => {
+    // GPT inserts "—" between words
+    mockChatCreate.mockResolvedValue({
+      choices: [{ message: { content: 'Привет, — мир!' } }],
+    });
+
+    const transcript = {
+      words: [
+        { word: ' привет', start: 0, end: 0.5 },
+        { word: ' мир', start: 0.5, end: 1.0 },
+      ],
+      segments: [{ text: 'привет мир', start: 0, end: 1.0 }],
+      language: 'ru',
+      duration: 1.0,
+    };
+
+    const result = await addPunctuation(transcript, { apiKey: 'test-key' });
+
+    // Should still match both words despite the inserted "—"
+    expect(result.words).toHaveLength(2);
+    expect(stripPunctuation(result.words[0].word).trim().toLowerCase()).toBe('привет');
+    expect(stripPunctuation(result.words[1].word).trim().toLowerCase()).toBe('мир');
+  });
+
+  it('calls onProgress with punctuation status', async () => {
+    mockChatCreate.mockResolvedValue({
+      choices: [{ message: { content: 'Слово.' } }],
+    });
+
+    const transcript = {
+      words: [{ word: ' слово', start: 0, end: 1 }],
+      segments: [{ text: 'слово', start: 0, end: 1 }],
+      language: 'ru',
+      duration: 1,
+    };
+
+    const onProgress = vi.fn();
+    await addPunctuation(transcript, { apiKey: 'test-key', onProgress });
+
+    // Should report start (0%) and complete (100%)
+    expect(onProgress).toHaveBeenCalledWith('punctuation', 0, 'active', expect.stringContaining('1 words'));
+    expect(onProgress).toHaveBeenCalledWith('punctuation', 100, 'complete', expect.any(String));
   });
 });

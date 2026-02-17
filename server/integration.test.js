@@ -89,6 +89,11 @@ import {
   transcribeAudioChunk,
   addPunctuation,
   lemmatizeWords,
+  isLibRuUrl,
+  fetchLibRuText,
+  generateTtsAudio,
+  getAudioDuration,
+  estimateWordTimestamps,
 } from './media.js';
 
 // Import server after mocks are set up
@@ -414,9 +419,9 @@ describe('C. POST /api/analyze — Error Cases', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: 'https://ok.ru/video/123' }),
       });
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(500);
       const body = await res.json();
-      expect(body.error).toMatch(/API key/i);
+      expect(body.error).toMatch(/not configured/i);
     } finally {
       process.env.OPENAI_API_KEY = origKey;
     }
@@ -831,7 +836,7 @@ describe('H. POST /api/translate', () => {
     expect(body.error).toMatch(/word is required/i);
   });
 
-  it('missing API key returns 400', async () => {
+  it('missing API key returns 500', async () => {
     const origKey = process.env.GOOGLE_TRANSLATE_API_KEY;
     delete process.env.GOOGLE_TRANSLATE_API_KEY;
 
@@ -841,9 +846,9 @@ describe('H. POST /api/translate', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ word: 'тест' }),
       });
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(500);
       const body = await res.json();
-      expect(body.error).toMatch(/API key/i);
+      expect(body.error).toMatch(/not configured/i);
     } finally {
       process.env.GOOGLE_TRANSLATE_API_KEY = origKey;
     }
@@ -923,5 +928,205 @@ describe('J. SSE Progress Format', () => {
     // Verify the client was cleaned up
     const clients = progressClients.get('disconnect-test');
     expect(!clients || clients.length === 0).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// K. Text Mode (lib.ru) Analysis
+// ---------------------------------------------------------------------------
+
+describe('K. Text Mode (lib.ru) Analysis', () => {
+  function setupTextModeMocks() {
+    isLibRuUrl.mockImplementation((url) => url.includes('lib.ru'));
+    fetchLibRuText.mockResolvedValue({
+      title: 'Мастер и Маргарита',
+      author: 'Булгаков',
+      text: 'В час жаркого весеннего заката на Патриарших прудах появилось двое граждан. Первый из них — приблизительно сорокалетний, одетый в серенькую летнюю пару.',
+    });
+    generateTtsAudio.mockImplementation(async (text, audioPath) => {
+      fs.writeFileSync(audioPath, 'fake-tts-audio');
+    });
+    getAudioDuration.mockReturnValue(30);
+    estimateWordTimestamps.mockImplementation((text, duration) => ({
+      words: text.split(/\s+/).map((w, i) => ({
+        word: (i > 0 ? ' ' : '') + w,
+        start: (i / text.split(/\s+/).length) * duration,
+        end: ((i + 1) / text.split(/\s+/).length) * duration,
+      })),
+      segments: [{ text, start: 0, end: duration }],
+      language: 'ru',
+      duration,
+    }));
+    lemmatizeWords.mockImplementation(async (t) => t);
+  }
+
+  it('lib.ru URL produces text session with chunks', async () => {
+    setupTextModeMocks();
+    setupHappyPathMocks(); // also needed for base mocks
+
+    const { sessionId, completeEvent } = await analyzeAndWait('https://lib.ru/PROZA/BULGAKOW/master.txt');
+
+    expect(completeEvent.contentType).toBe('text');
+    expect(completeEvent.title).toContain('Булгаков');
+    expect(completeEvent.title).toContain('Мастер и Маргарита');
+    expect(completeEvent.chunks.length).toBeGreaterThan(0);
+  });
+
+  it('text session GET returns contentType text', async () => {
+    setupTextModeMocks();
+    setupHappyPathMocks();
+
+    const { sessionId } = await analyzeAndWait('https://lib.ru/PROZA/text-session-' + Date.now() + '.txt');
+
+    const res = await fetch(`${baseUrl}/api/session/${sessionId}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.contentType).toBe('text');
+    expect(body.status).toBe('ready');
+  });
+
+  it('text chunk download generates TTS audio', async () => {
+    setupTextModeMocks();
+    setupHappyPathMocks();
+
+    const { sessionId, completeEvent } = await analyzeAndWait('https://lib.ru/PROZA/tts-' + Date.now() + '.txt');
+
+    const chunk = completeEvent.chunks[0];
+
+    // Download the first chunk (triggers TTS pipeline)
+    const dlRes = await fetch(`${baseUrl}/api/download-chunk`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, chunkId: chunk.id }),
+    });
+    expect(dlRes.status).toBe(200);
+    const dlBody = await dlRes.json();
+    expect(dlBody.audioUrl).toBeTruthy();
+    expect(dlBody.transcript).toBeTruthy();
+    expect(dlBody.transcript.words.length).toBeGreaterThan(0);
+
+    // Verify TTS was called
+    expect(generateTtsAudio).toHaveBeenCalled();
+    expect(getAudioDuration).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L. POST /api/extract-sentence
+// ---------------------------------------------------------------------------
+
+describe('L. POST /api/extract-sentence', () => {
+  it('extracts and translates a sentence via GPT', async () => {
+    const mockGptResponse = {
+      ok: true,
+      json: async () => ({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              sentence: 'В час жаркого весеннего заката.',
+              translation: 'At the hour of the hot spring sunset.',
+            }),
+          },
+        }],
+      }),
+    };
+
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((url, ...args) => {
+      if (typeof url === 'string' && url.includes('openai.com')) {
+        return Promise.resolve(mockGptResponse);
+      }
+      return originalFetch(url, ...args);
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/extract-sentence`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: 'В час жаркого весеннего заката на Патриарших прудах появилось двое граждан.',
+          word: 'заката',
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.sentence).toBe('В час жаркого весеннего заката.');
+      expect(body.translation).toBe('At the hour of the hot spring sunset.');
+
+      // Verify OpenAI API was called
+      const openaiCalls = fetchSpy.mock.calls.filter(
+        c => typeof c[0] === 'string' && c[0].includes('openai.com')
+      );
+      expect(openaiCalls.length).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('missing text returns 400', async () => {
+    const res = await fetch(`${baseUrl}/api/extract-sentence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ word: 'тест' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/text and word are required/i);
+  });
+
+  it('missing word returns 400', async () => {
+    const res = await fetch(`${baseUrl}/api/extract-sentence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Какой-то текст.' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/text and word are required/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M. URL Cache TTL
+// ---------------------------------------------------------------------------
+
+describe('M. URL Cache TTL', () => {
+  it('expired cache entry is not reused', async () => {
+    setupHappyPathMocks();
+
+    // Analyze once to populate cache
+    const { sessionId: firstId } = await analyzeAndWait('https://ok.ru/video/ttl-test-' + Date.now());
+
+    // Verify cache exists
+    expect(urlSessionCache.size).toBeGreaterThan(0);
+
+    // Manually expire the cache entry
+    for (const [key, value] of urlSessionCache) {
+      value.timestamp = Date.now() - (7 * 60 * 60 * 1000); // 7 hours ago (TTL is 6 hours)
+    }
+
+    // Re-analyze the same URL — should create new session (cache expired)
+    const { sessionId: secondId } = await analyzeAndWait('https://ok.ru/video/ttl-test-' + Date.now());
+
+    // Different session IDs since cache was expired
+    expect(secondId).not.toBe(firstId);
+  });
+
+  it('non-expired cache returns same session', async () => {
+    setupHappyPathMocks();
+
+    const uniqueUrl = 'https://ok.ru/video/cache-reuse-' + Date.now();
+    const { sessionId: firstId } = await analyzeAndWait(uniqueUrl);
+
+    // Re-analyze same URL (cache still fresh)
+    const analyzeRes = await fetch(`${baseUrl}/api/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: uniqueUrl }),
+    });
+    const body = await analyzeRes.json();
+
+    expect(body.status).toBe('cached');
+    expect(body.sessionId).toBe(firstId);
   });
 });

@@ -75,7 +75,7 @@ export function VideoPlayer({
     if (source.type !== 'youtube') return;
 
     if (window.YT && window.YT.Player) {
-      setYtReady(true);
+      setYtReady(true); // eslint-disable-line react-hooks/set-state-in-effect -- checking external API readiness
       return;
     }
 
@@ -311,7 +311,7 @@ export function VideoPlayer({
       case 'youtube':
       case 'vimeo':
         return <div ref={containerRef} className="w-full aspect-video" />;
-      case 'direct':
+      case 'direct': {
         // For HLS, don't set src - hls.js will handle it
         const isHls = source.url.includes('.m3u8');
         return (
@@ -324,6 +324,7 @@ export function VideoPlayer({
             crossOrigin="anonymous"
           />
         );
+      }
     }
   };
 

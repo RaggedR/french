@@ -14,7 +14,7 @@
 - **Location**: `server/`
 - **Hosted**: Google Cloud Run (`https://russian-transcription-770103525576.us-central1.run.app`)
 - **Endpoints**:
-  - `POST /api/transcribe` - Main endpoint: downloads video, transcribes audio
+  - `POST /api/analyze` - Main endpoint: downloads video, transcribes audio, chunks
   - `POST /api/translate` - Translates Russian words to English
   - `GET /api/hls/:sessionId/*` - HLS proxy (not currently used - IP-locked)
 

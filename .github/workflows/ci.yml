@@ -9,6 +9,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+      VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+      VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+      VITE_FIREBASE_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
+      VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+      VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
 
     steps:
       - uses: actions/checkout@v4
@@ -39,17 +46,119 @@ jobs:
         if: steps.docs-check.outputs.skip != 'true'
         run: npm ci && cd server && npm ci
 
+      - name: Lint
+        if: steps.docs-check.outputs.skip != 'true'
+        run: npm run lint
+
       - name: Build
         if: steps.docs-check.outputs.skip != 'true'
         run: npm run build
 
-      - name: Test
+      - name: Unit & integration tests
         if: steps.docs-check.outputs.skip != 'true'
-        env:
-          VITE_FIREBASE_API_KEY: test-key-for-ci
-          VITE_FIREBASE_AUTH_DOMAIN: test.firebaseapp.com
-          VITE_FIREBASE_PROJECT_ID: test-project
-          VITE_FIREBASE_STORAGE_BUCKET: test.appspot.com
-          VITE_FIREBASE_MESSAGING_SENDER_ID: "123456789"
-          VITE_FIREBASE_APP_ID: "1:123:web:abc"
         run: npm test
+
+      - name: Install Playwright browsers
+        if: steps.docs-check.outputs.skip != 'true'
+        run: cd e2e && npx playwright install chromium --with-deps
+
+      - name: E2E tests
+        if: steps.docs-check.outputs.skip != 'true'
+        run: npm run test:e2e
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+      VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+      VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+      VITE_FIREBASE_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
+      VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+      VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker --quiet
+
+      - name: Get Cloud Run URL for frontend build
+        id: get-url
+        run: |
+          # On first deploy, service won't exist yet — URL will be empty.
+          # This is fine: empty VITE_API_URL means the frontend uses relative
+          # URLs (same origin), which is correct when served from Cloud Run.
+          URL=$(gcloud run services describe russian-transcription \
+            --region us-central1 \
+            --format 'value(status.url)' 2>/dev/null || echo "")
+          echo "backend_url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Build frontend
+        run: |
+          echo "VITE_API_URL=${{ steps.get-url.outputs.backend_url }}" > .env.production
+          npm run build
+
+      - name: Prepare server with frontend
+        run: cp -r dist server/
+
+      - name: Build and push Docker image
+        run: |
+          # Note: github-deploy SA has storage.admin which covers GCR image
+          # pull access for the base image (russian-base:latest)
+          IMAGE="gcr.io/russian-transcription/russian-transcription"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          cd server
+          docker build --platform linux/amd64 \
+            -t $IMAGE:latest \
+            -t $IMAGE:${{ github.sha }} \
+            -t $IMAGE:$SHORT_SHA \
+            .
+          docker push $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:$SHORT_SHA
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy russian-transcription \
+            --image gcr.io/russian-transcription/russian-transcription:latest \
+            --region us-central1 \
+            --allow-unauthenticated \
+            --memory 1Gi \
+            --timeout 300 \
+            --max-instances 1 \
+            --set-secrets="OPENAI_API_KEY=openai-api-key:latest,GOOGLE_TRANSLATE_API_KEY=google-translate-key:latest" \
+            --set-env-vars="GCS_BUCKET=russian-transcription-videos"
+
+      - name: Verify deployment
+        run: |
+          URL=$(gcloud run services describe russian-transcription \
+            --region us-central1 \
+            --format 'value(status.url)')
+          echo "Deployed to: $URL"
+          curl -sf "$URL/api/health" || echo "Health check pending (cold start)"

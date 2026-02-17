@@ -194,17 +194,22 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
   const [reviewedCount, setReviewedCount] = useState(0);
   const [waitingSeconds, setWaitingSeconds] = useState<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionActiveRef = useRef(false);
 
-  // Initialize queue when panel opens
+  // Initialize queue when panel opens (not when dueCards changes mid-session)
   useEffect(() => {
-    if (isOpen) {
+    if (isOpen && !sessionActiveRef.current) {
+      sessionActiveRef.current = true;
       const items: QueueItem[] = dueCards.map(card => ({ card, dueAt: 0 }));
+      /* eslint-disable react-hooks/set-state-in-effect -- intentional: initializing review session state from props */
       setQueue(items.slice(1));
       setCurrentItem(items[0] || null);
       setShowAnswer(false);
       setReviewedCount(0);
       setWaitingSeconds(null);
-    } else {
+      /* eslint-enable react-hooks/set-state-in-effect */
+    } else if (!isOpen) {
+      sessionActiveRef.current = false;
       // Clean up timer when closing
       if (timerRef.current) {
         clearInterval(timerRef.current);

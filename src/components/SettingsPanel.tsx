@@ -15,10 +15,6 @@ export function SettingsPanel({
 }: SettingsPanelProps) {
   if (!isOpen) return null;
 
-  const handleGoogleApiKeyChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    onConfigChange({ ...config, googleApiKey: e.target.value });
-  };
-
   return (
     <>
       {/* Backdrop */}
@@ -36,23 +32,6 @@ export function SettingsPanel({
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
-        </div>
-
-        {/* Google API Key */}
-        <div className="mb-6">
-          <label className="block text-sm font-medium text-gray-700 mb-2">
-            Google Translate API Key
-          </label>
-          <input
-            type="password"
-            value={config.googleApiKey || ''}
-            onChange={handleGoogleApiKeyChange}
-            placeholder="Enter your API key"
-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-          <p className="text-xs text-gray-500 mt-1">
-            Required for translations. Get from Google Cloud Console
-          </p>
         </div>
 
         {/* Word Frequency Underlining */}

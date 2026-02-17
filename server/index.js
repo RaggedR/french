@@ -483,214 +483,20 @@ const extractSentenceRateLimit = rateLimit({
 const translationCache = new Map();
 
 /**
- * POST /api/transcribe
- * Accepts: { url: string, openaiApiKey: string }
- * Returns: { videoUrl: string, transcript: { words: [], segments: [], language: string, duration: number } }
- */
-app.post('/api/transcribe', async (req, res) => {
-  const { url, openaiApiKey } = req.body;
-  const apiKey = openaiApiKey || process.env.OPENAI_API_KEY;
-
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
-  }
-
-  if (!apiKey) {
-    return res.status(400).json({ error: 'OpenAI API key is required (set in .env or pass in request)' });
-  }
-
-  const tempDir = path.join(__dirname, 'temp');
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-  }
-
-  const timestamp = Date.now();
-  const audioPath = path.join(tempDir, `audio_${timestamp}.mp3`);
-
-  try {
-    console.log(`[Transcribe] Processing URL: ${url}`);
-
-    // Check if this site needs local video download (CORS issues)
-    const needsLocalVideo = /ok\.ru/.test(url);
-    let playbackUrl;
-
-    if (needsLocalVideo) {
-      // For ok.ru: Download video to GCS (HLS URLs are IP-locked)
-      // Optimized: video download runs in parallel with audio+transcription
-      const sessionId = timestamp.toString();
-      const videoPath = path.join(tempDir, `video_${timestamp}.mp4`);
-      const openai = new OpenAI({ apiKey });
-
-      // Step 1: Start video download immediately (don't wait - runs in parallel)
-      console.log('[Transcribe] Starting video download...');
-      const videoPromise = ytdlp(url, {
-        format: 'best[height<=360]/best',  // 360p for faster download
-        output: videoPath,
-        noWarnings: true,
-        concurrentFragments: 8,
-      });
-
-      // Step 2: Download audio (smaller, faster)
-      console.log('[Transcribe] Downloading audio...');
-      await ytdlp(url, {
-        extractAudio: true,
-        audioFormat: 'mp3',
-        output: audioPath,
-        noWarnings: true,
-      });
-
-      // Step 3: Transcribe with Whisper (video still downloading in background)
-      console.log('[Transcribe] Sending to Whisper API...');
-      const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(audioPath),
-        model: 'whisper-1',
-        response_format: 'verbose_json',
-        timestamp_granularities: ['word', 'segment'],
-        language: 'ru',
-      });
-
-      console.log('[Transcribe] Transcription complete');
-      fs.unlinkSync(audioPath);
-
-      const transcript = {
-        words: transcription.words || [],
-        segments: transcription.segments || [],
-        language: transcription.language || 'ru',
-        duration: transcription.duration || 0,
-      };
-
-      // Step 4: Wait for video download to complete
-      console.log('[Transcribe] Waiting for video download...');
-      await videoPromise;
-
-      let videoUrl;
-      if (!IS_LOCAL && bucket) {
-        // Upload to GCS
-        console.log('[Transcribe] Uploading video to GCS...');
-        const gcsFileName = `videos/${sessionId}.mp4`;
-        await bucket.upload(videoPath, {
-          destination: gcsFileName,
-          metadata: {
-            contentType: 'video/mp4',
-            cacheControl: 'public, max-age=86400',
-          },
-        });
-
-        // Make the file publicly accessible
-        await bucket.file(gcsFileName).makePublic();
-        videoUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
-        console.log(`[Transcribe] Video uploaded to GCS: ${videoUrl}`);
-      } else {
-        // Local dev: serve from temp directory (won't persist but works for testing)
-        videoUrl = `/api/local-video/${sessionId}.mp4`;
-        // Keep video file for local serving
-        localSessions.set(`video_${sessionId}`, videoPath);
-      }
-
-      // Clean up temp video file (for GCS mode)
-      if (!IS_LOCAL && fs.existsSync(videoPath)) {
-        fs.unlinkSync(videoPath);
-      }
-
-      return res.json({
-        videoUrl,
-        transcript,
-        title: 'OK.ru Video',
-      });
-    }
-
-    // For other sites (YouTube, etc.): Need dumpJson for direct URL extraction
-    console.log('[Transcribe] Getting video info...');
-    const info = await ytdlp(url, {
-      dumpJson: true,
-      noWarnings: true,
-    });
-
-    // Use direct URL for YouTube, Vimeo, etc.
-    let videoUrl = info.url;
-    if (!videoUrl && info.formats) {
-      const formats = info.formats.filter(f => f.vcodec !== 'none' && f.acodec !== 'none');
-      if (formats.length > 0) {
-        formats.sort((a, b) => (b.height || 0) - (a.height || 0));
-        videoUrl = formats[0].url;
-      }
-    }
-    if (!videoUrl) {
-      throw new Error('Could not extract video URL');
-    }
-    playbackUrl = videoUrl;
-    console.log('[Transcribe] Video URL extracted');
-
-    // Step 2: Download audio for Whisper
-    console.log('[Transcribe] Downloading audio...');
-    await ytdlp(url, {
-      extractAudio: true,
-      audioFormat: 'mp3',
-      output: audioPath,
-      noWarnings: true,
-    });
-
-    console.log('[Transcribe] Audio downloaded');
-
-    // Step 3: Transcribe with OpenAI Whisper
-    console.log('[Transcribe] Sending to Whisper API...');
-    const openai = new OpenAI({ apiKey });
-
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: 'whisper-1',
-      response_format: 'verbose_json',
-      timestamp_granularities: ['word', 'segment'],
-      language: 'ru',
-    });
-
-    console.log('[Transcribe] Transcription complete');
-
-    // Clean up temp file
-    fs.unlinkSync(audioPath);
-
-    // Format response
-    const transcript = {
-      words: transcription.words || [],
-      segments: transcription.segments || [],
-      language: transcription.language || 'ru',
-      duration: transcription.duration || 0,
-    };
-
-    res.json({
-      videoUrl: playbackUrl,
-      transcript,
-      title: info.title || 'Untitled Video',
-    });
-  } catch (error) {
-    console.error('[Transcribe] Error:', error);
-
-    // Clean up temp file if it exists
-    if (fs.existsSync(audioPath)) {
-      fs.unlinkSync(audioPath);
-    }
-
-    res.status(500).json({
-      error: error.message || 'Transcription failed',
-    });
-  }
-});
-
-/**
  * POST /api/translate
- * Accepts: { word: string, googleApiKey: string }
+ * Accepts: { word: string }
  * Returns: { word: string, translation: string, sourceLanguage: string }
  */
 app.post('/api/translate', translateRateLimit, requireTranslateBudget, async (req, res) => {
-  const { word, googleApiKey } = req.body;
-  const apiKey = googleApiKey || process.env.GOOGLE_TRANSLATE_API_KEY;
+  const { word } = req.body;
+  const apiKey = process.env.GOOGLE_TRANSLATE_API_KEY;
 
   if (!word) {
     return res.status(400).json({ error: 'Word is required' });
   }
 
   if (!apiKey) {
-    return res.status(400).json({ error: 'Google API key is required (set in .env or pass in request)' });
+    return res.status(500).json({ error: 'Translation service not configured' });
   }
 
   const cacheKey = `ru:${word.toLowerCase()}`;
@@ -1103,7 +909,7 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
   }
 
   if (!apiKey) {
-    return res.status(400).json({ error: 'OpenAI API key not configured on server' });
+    return res.status(500).json({ error: 'Transcription service not configured' });
   }
 
   // Check if we have a cached session for this URL
