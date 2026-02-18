@@ -13,8 +13,8 @@ import rateLimit from 'express-rate-limit';
 import * as Sentry from '@sentry/node';
 import { createChunks, createTextChunks, getChunkTranscript, formatTime } from './chunking.js';
 import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps } from './media.js';
-import { requireAuth } from './auth.js';
-import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget, initUsageStore } from './usage.js';
+import { requireAuth, adminAuth } from './auth.js';
+import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget, initUsageStore, getUserCost, getUserWeeklyCost, getUserMonthlyCost, getTranslateDailyCost, getTranslateWeeklyCost, getTranslateMonthlyCost, DAILY_LIMIT, WEEKLY_LIMIT, MONTHLY_LIMIT, TRANSLATE_DAILY_LIMIT, TRANSLATE_WEEKLY_LIMIT, TRANSLATE_MONTHLY_LIMIT } from './usage.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -453,7 +453,13 @@ function isAllowedProxyUrl(urlString) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    /^https:\/\/russian-transcription.*\.run\.app$/,
+    'http://localhost:5173',
+    'http://localhost:3001',
+  ],
+}));
 app.use(express.json());
 
 // Health check — before auth so monitoring works without tokens
@@ -548,6 +554,107 @@ async function requireSessionOwnership(req, res, next) {
   next();
 }
 
+/**
+ * GET /api/usage
+ * Returns current user's API usage across all limit periods.
+ */
+app.get('/api/usage', (req, res) => {
+  res.json({
+    openai: {
+      daily: { used: getUserCost(req.uid), limit: DAILY_LIMIT },
+      weekly: { used: getUserWeeklyCost(req.uid), limit: WEEKLY_LIMIT },
+      monthly: { used: getUserMonthlyCost(req.uid), limit: MONTHLY_LIMIT },
+    },
+    translate: {
+      daily: { used: getTranslateDailyCost(req.uid), limit: TRANSLATE_DAILY_LIMIT },
+      weekly: { used: getTranslateWeeklyCost(req.uid), limit: TRANSLATE_WEEKLY_LIMIT },
+      monthly: { used: getTranslateMonthlyCost(req.uid), limit: TRANSLATE_MONTHLY_LIMIT },
+    },
+  });
+});
+
+/**
+ * DELETE /api/account
+ * Permanently delete the user's account and all associated data:
+ * 1. Firestore decks/{uid} and usage/{uid}
+ * 2. GCS sessions owned by the user
+ * 3. In-memory sessions
+ * 4. Firebase Auth user
+ */
+app.delete('/api/account', async (req, res) => {
+  const uid = req.uid;
+  console.log(`[Account] Deleting account for ${uid}`);
+
+  try {
+    // 1. Delete Firestore documents (decks + usage)
+    try {
+      const { getFirestore } = await import('firebase-admin/firestore');
+      const db = getFirestore();
+      await Promise.all([
+        db.collection('decks').doc(uid).delete().catch(() => {}),
+        db.collection('usage').doc(uid).delete().catch(() => {}),
+      ]);
+      console.log(`[Account] Deleted Firestore docs for ${uid}`);
+    } catch (err) {
+      console.log(`[Account] Firestore cleanup skipped:`, err.message);
+    }
+
+    // 2. Delete GCS sessions owned by the user
+    if (!IS_LOCAL && bucket) {
+      try {
+        const [sessionFiles] = await bucket.getFiles({ prefix: 'sessions/' });
+        for (const file of sessionFiles) {
+          try {
+            const [contents] = await file.download();
+            const session = JSON.parse(contents.toString());
+            if (session.uid === uid) {
+              const sessionId = file.name.replace('sessions/', '').replace('.json', '');
+              // Delete associated videos
+              const [videoFiles] = await bucket.getFiles({ prefix: `videos/${sessionId}_` });
+              for (const vf of videoFiles) {
+                await vf.delete().catch(() => {});
+              }
+              await file.delete().catch(() => {});
+              console.log(`[Account] Deleted GCS session ${sessionId}`);
+            }
+          } catch {
+            // Skip unreadable sessions
+          }
+        }
+      } catch (err) {
+        console.error(`[Account] GCS cleanup error:`, err.message);
+      }
+    }
+
+    // 3. Clean up in-memory sessions
+    for (const [sessionId, session] of analysisSessions) {
+      if (session.uid === uid) {
+        analysisSessions.delete(sessionId);
+      }
+    }
+    // Clean up URL cache entries for this user
+    for (const [key] of urlSessionCache) {
+      if (key.startsWith(`${uid}:`)) {
+        urlSessionCache.delete(key);
+      }
+    }
+
+    // 4. Delete Firebase Auth user
+    try {
+      await adminAuth.deleteUser(uid);
+      console.log(`[Account] Deleted Firebase Auth user ${uid}`);
+    } catch (err) {
+      // May fail in tests or if user already deleted
+      console.log(`[Account] Auth user deletion skipped:`, err.message);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error(`[Account] Error deleting account:`, error);
+    res.status(500).json({ error: error.message || 'Failed to delete account' });
+  }
+});
+
 // Translation cache (in-memory for simplicity, could use Redis in production)
 const translationCache = new Map();
 
@@ -562,6 +669,10 @@ app.post('/api/translate', translateRateLimit, requireTranslateBudget, async (re
 
   if (!word) {
     return res.status(400).json({ error: 'Word is required' });
+  }
+
+  if (word.length > 200) {
+    return res.status(400).json({ error: 'Word is too long (max 200 characters)' });
   }
 
   if (!apiKey) {
@@ -629,6 +740,14 @@ app.post('/api/extract-sentence', extractSentenceRateLimit, requireBudget, async
 
   if (!text || !word) {
     return res.status(400).json({ error: 'text and word are required' });
+  }
+
+  if (word.length > 200) {
+    return res.status(400).json({ error: 'Word is too long (max 200 characters)' });
+  }
+
+  if (text.length > 5000) {
+    return res.status(400).json({ error: 'Text is too long (max 5000 characters)' });
   }
 
   try {
@@ -992,6 +1111,18 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
 
   if (!url) {
     return res.status(400).json({ error: 'URL is required' });
+  }
+
+  // Only allow ok.ru video URLs and lib.ru text URLs
+  try {
+    const parsedUrl = new URL(url);
+    const isOkRu = parsedUrl.hostname === 'ok.ru' || parsedUrl.hostname.endsWith('.ok.ru');
+    const isLibRu = isLibRuUrl(url);
+    if (!isOkRu && !isLibRu) {
+      return res.status(400).json({ error: 'Only ok.ru and lib.ru URLs are supported' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL' });
   }
 
   if (!apiKey) {

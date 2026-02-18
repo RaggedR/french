@@ -57,13 +57,19 @@ function useAuthReal(): AuthState {
 // don't need real Google auth. The env var is set in playwright.config.ts.
 // Note: import.meta.env.VITE_E2E_TEST is resolved at build time by Vite,
 // so production builds (without the env var) always use useAuthReal.
+//
+// Tests can set window.__E2E_NO_AUTH = true (via addInitScript) to start
+// in a logged-out state, showing the login screen.
 function useAuthE2E(): AuthState {
+  const startLoggedOut = typeof window !== 'undefined' && (window as any).__E2E_NO_AUTH;
+  const [loggedIn, setLoggedIn] = useState(!startLoggedOut);
+
   return {
-    userId: 'e2e-test-user',
-    user: { displayName: 'Test User', photoURL: null, email: 'test@example.com' },
+    userId: loggedIn ? 'e2e-test-user' : null,
+    user: loggedIn ? { displayName: 'Test User', photoURL: null, email: 'test@example.com' } : null,
     isLoading: false,
-    signInWithGoogle: async () => {},
-    signOut: async () => {},
+    signInWithGoogle: useCallback(async () => { setLoggedIn(true); }, []),
+    signOut: useCallback(async () => { setLoggedIn(false); }, []),
   };
 }
 

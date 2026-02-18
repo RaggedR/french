@@ -1,10 +1,33 @@
-import type { TranslatorConfig } from '../types';
+import { useState, useEffect, useCallback } from 'react';
+import type { TranslatorConfig, SRSCard } from '../types';
+import { getUsage } from '../services/api';
+import type { UsageData } from '../services/api';
+import { TERMS_OF_SERVICE, PRIVACY_POLICY } from '../legal';
 
 interface SettingsPanelProps {
   config: TranslatorConfig;
   onConfigChange: (config: TranslatorConfig) => void;
   isOpen: boolean;
   onClose: () => void;
+  cards: SRSCard[];
+  userId: string | null;
+  onDeleteAccount: () => Promise<void>;
+}
+
+function UsageBar({ label, used, limit }: { label: string; used: number; limit: number }) {
+  const pct = limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
+  const color = pct > 80 ? 'bg-red-500' : pct > 50 ? 'bg-yellow-500' : 'bg-green-500';
+  return (
+    <div className="mb-2">
+      <div className="flex justify-between text-xs text-gray-600 mb-0.5">
+        <span>{label}</span>
+        <span>${used.toFixed(2)} / ${limit.toFixed(2)}</span>
+      </div>
+      <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+        <div className={`h-full ${color} rounded-full transition-all`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
 }
 
 export function SettingsPanel({
@@ -12,7 +35,62 @@ export function SettingsPanel({
   onConfigChange,
   isOpen,
   onClose,
+  cards,
+  userId,
+  onDeleteAccount,
 }: SettingsPanelProps) {
+  const [expandedLegal, setExpandedLegal] = useState<'tos' | 'privacy' | null>(null);
+  const [usage, setUsage] = useState<UsageData | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState('');
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Fetch usage when panel opens
+  useEffect(() => {
+    if (isOpen && userId) {
+      setUsageLoading(true);
+      getUsage()
+        .then(setUsage)
+        .catch(() => setUsage(null))
+        .finally(() => setUsageLoading(false));
+    }
+  }, [isOpen, userId]);
+
+  // Reset delete state when panel closes
+  useEffect(() => {
+    if (!isOpen) {
+      setDeleteConfirm('');
+      setDeleteError(null);
+    }
+  }, [isOpen]);
+
+  const handleExportDeck = useCallback(() => {
+    const json = JSON.stringify(cards, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const date = new Date().toISOString().slice(0, 10);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `russian-deck-${date}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [cards]);
+
+  const handleDeleteAccount = useCallback(async () => {
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      await onDeleteAccount();
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Failed to delete account');
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [onDeleteAccount]);
+
   if (!isOpen) return null;
 
   return (
@@ -74,6 +152,42 @@ export function SettingsPanel({
           </p>
         </div>
 
+        {/* Deck Export */}
+        <div className="mb-6 border-t pt-6">
+          <h3 className="text-sm font-medium text-gray-700 mb-2">Deck</h3>
+          <button
+            onClick={handleExportDeck}
+            disabled={cards.length === 0}
+            data-testid="export-deck-btn"
+            className="w-full px-4 py-2 text-sm font-medium rounded-md border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {cards.length === 0 ? 'No cards to export' : `Export ${cards.length} cards`}
+          </button>
+        </div>
+
+        {/* Usage */}
+        {userId && (
+          <div className="mb-6 border-t pt-6">
+            <h3 className="text-sm font-medium text-gray-700 mb-3">API Usage</h3>
+            {usageLoading ? (
+              <p className="text-xs text-gray-400">Loading...</p>
+            ) : usage ? (
+              <div>
+                <p className="text-xs text-gray-500 mb-2 font-medium">OpenAI</p>
+                <UsageBar label="Today" used={usage.openai.daily.used} limit={usage.openai.daily.limit} />
+                <UsageBar label="This week" used={usage.openai.weekly.used} limit={usage.openai.weekly.limit} />
+                <UsageBar label="This month" used={usage.openai.monthly.used} limit={usage.openai.monthly.limit} />
+                <p className="text-xs text-gray-500 mb-2 mt-3 font-medium">Translation</p>
+                <UsageBar label="Today" used={usage.translate.daily.used} limit={usage.translate.daily.limit} />
+                <UsageBar label="This week" used={usage.translate.weekly.used} limit={usage.translate.weekly.limit} />
+                <UsageBar label="This month" used={usage.translate.monthly.used} limit={usage.translate.monthly.limit} />
+              </div>
+            ) : (
+              <p className="text-xs text-gray-400">Could not load usage data</p>
+            )}
+          </div>
+        )}
+
         {/* Info */}
         <div className="border-t pt-6">
           <h3 className="text-sm font-medium text-gray-700 mb-2">About</h3>
@@ -88,6 +202,66 @@ export function SettingsPanel({
             OpenAI API key is configured on the server.
           </p>
         </div>
+
+        {/* Legal */}
+        <div className="border-t pt-6 mt-6">
+          <button
+            onClick={() => setExpandedLegal(expandedLegal === 'tos' ? null : 'tos')}
+            className="w-full text-left text-sm font-medium text-gray-700 hover:text-gray-900 flex justify-between items-center"
+            data-testid="tos-toggle"
+          >
+            Terms of Service
+            <span className="text-gray-400">{expandedLegal === 'tos' ? '−' : '+'}</span>
+          </button>
+          {expandedLegal === 'tos' && (
+            <div className="mt-2 max-h-64 overflow-y-auto text-xs text-gray-500 whitespace-pre-line" data-testid="tos-content">
+              {TERMS_OF_SERVICE}
+            </div>
+          )}
+
+          <button
+            onClick={() => setExpandedLegal(expandedLegal === 'privacy' ? null : 'privacy')}
+            className="w-full text-left text-sm font-medium text-gray-700 hover:text-gray-900 flex justify-between items-center mt-4"
+            data-testid="privacy-toggle"
+          >
+            Privacy Policy
+            <span className="text-gray-400">{expandedLegal === 'privacy' ? '−' : '+'}</span>
+          </button>
+          {expandedLegal === 'privacy' && (
+            <div className="mt-2 max-h-64 overflow-y-auto text-xs text-gray-500 whitespace-pre-line" data-testid="privacy-content">
+              {PRIVACY_POLICY}
+            </div>
+          )}
+        </div>
+
+        {/* Delete Account */}
+        {userId && (
+          <div className="border-t pt-6 mt-6 mb-8">
+            <h3 className="text-sm font-medium text-red-600 mb-2">Danger Zone</h3>
+            <p className="text-xs text-gray-500 mb-3">
+              Permanently delete your account, flashcard deck, and all session data. This cannot be undone.
+            </p>
+            {deleteError && (
+              <p className="text-xs text-red-600 mb-2">{deleteError}</p>
+            )}
+            <input
+              type="text"
+              value={deleteConfirm}
+              onChange={(e) => setDeleteConfirm(e.target.value)}
+              placeholder='Type "DELETE" to confirm'
+              data-testid="delete-confirm-input"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm mb-2 focus:outline-none focus:ring-2 focus:ring-red-500"
+            />
+            <button
+              onClick={handleDeleteAccount}
+              disabled={deleteConfirm !== 'DELETE' || isDeleting}
+              data-testid="delete-account-btn"
+              className="w-full px-4 py-2 text-sm font-medium rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {isDeleting ? 'Deleting...' : 'Delete My Account'}
+            </button>
+          </div>
+        )}
       </div>
     </>
   );

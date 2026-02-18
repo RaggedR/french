@@ -8,7 +8,7 @@ initializeApp({
   credential: applicationDefault(),
 });
 
-const adminAuth = getAuth();
+export const adminAuth = getAuth();
 
 /**
  * Express middleware that verifies Firebase ID tokens.

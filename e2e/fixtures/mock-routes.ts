@@ -127,6 +127,37 @@ export async function setupMockRoutes(page: Page, options: {
     });
   });
 
+  // GET /api/usage → mock usage data
+  await page.route('**/api/usage', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        openai: {
+          daily: { used: 0.45, limit: 1.00 },
+          weekly: { used: 1.20, limit: 5.00 },
+          monthly: { used: 3.50, limit: 10.00 },
+        },
+        translate: {
+          daily: { used: 0.10, limit: 0.50 },
+          weekly: { used: 0.40, limit: 2.50 },
+          monthly: { used: 1.00, limit: 5.00 },
+        },
+      }),
+    });
+  });
+
+  // DELETE /api/account → success
+  await page.route('**/api/account', async (route) => {
+    if (route.request().method() === 'DELETE') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true }),
+      });
+    }
+  });
+
   // GET /api/progress/:sessionId → SSE stream (immediate connected + complete)
   await page.route('**/api/progress/**', async (route) => {
     const sseBody = [
