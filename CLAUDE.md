@@ -277,12 +277,17 @@ GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`
 - ~~Sentry error monitoring~~ (PR #16)
 - ~~Production hardening: SSRF, CORS, input validation, concurrency limits~~ (PR #18)
 - ~~Legal docs, usage UI, deck export, account deletion, GCP monitoring~~ (PR #19)
-- ~~Pre-processed demo content, helmet.js, health check, graceful shutdown, SSE timeout~~ (PR #20)
+- ~~Pre-processed demo content, health check, graceful shutdown, SSE timeout~~ (PR #20)
+
+### In Progress
+- **Google Sign-In broken on production** — debugging. Use `./quick-deploy.sh` to push directly to main while iterating on this fix. Auth errors now displayed on login screen.
+- **Helmet.js disabled** — multiple headers (COOP, CORP, CSP) break Firebase `signInWithPopup`. Reverted in PR #23. Needs to be re-implemented with a carefully tested config that works with Firebase Auth + Google Sign-In + cross-origin CDN resources.
 
 ### Payment (Priority: HIGH — Next)
 - Add Stripe subscription: $10/month, first month free
 - Enforce usage quotas per tier (free trial vs paid)
 
 ### Future
+- Re-enable helmet.js with Firebase-compatible config
 - Import deck functionality (export already implemented)
 - Android app (React Native or PWA wrapper)
