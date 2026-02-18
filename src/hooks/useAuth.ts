@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut, GoogleAuthProvider } from 'firebase/auth';
+import { onAuthStateChanged, signInWithRedirect, signOut as firebaseSignOut, GoogleAuthProvider } from 'firebase/auth';
 import { auth } from '../firebase';
 
 export interface AuthUser {
@@ -43,7 +43,7 @@ function useAuthReal(): AuthState {
   }, []);
 
   const signInWithGoogle = useCallback(async () => {
-    await signInWithPopup(auth, googleProvider);
+    await signInWithRedirect(auth, googleProvider);
   }, []);
 
   const signOut = useCallback(async () => {
