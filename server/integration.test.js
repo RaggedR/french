@@ -479,6 +479,7 @@ describe('D. GET /api/session/:sessionId', () => {
   it('error session returns error info', async () => {
     analysisSessions.set('err-session', {
       status: 'error',
+      uid: 'test-user',
       error: 'Something went wrong',
     });
 
@@ -492,6 +493,7 @@ describe('D. GET /api/session/:sessionId', () => {
   it('downloading session returns progress', async () => {
     analysisSessions.set('dl-session', {
       status: 'downloading',
+      uid: 'test-user',
       progress: { audio: 50, transcription: 0 },
     });
 
@@ -879,9 +881,9 @@ describe('I. DELETE /api/session/:sessionId', () => {
     expect(res.status).toBe(404);
   });
 
-  it('deleting non-existent session returns 200 (idempotent)', async () => {
+  it('deleting non-existent session returns 404', async () => {
     const res = await fetch(`${baseUrl}/api/session/nonexistent-123`, { method: 'DELETE' });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(404);
   });
 });
 
@@ -891,6 +893,12 @@ describe('I. DELETE /api/session/:sessionId', () => {
 
 describe('J. SSE Progress Format', () => {
   it('connected event is sent on subscribe', async () => {
+    // Create a session so ownership check passes
+    analysisSessions.set('test-session-1', {
+      status: 'downloading',
+      uid: 'test-user',
+    });
+
     const sse = createSSEClient(`${baseUrl}/api/progress/test-session-1`);
     try {
       const connected = await sse.waitForEvent('connected');
@@ -904,6 +912,7 @@ describe('J. SSE Progress Format', () => {
   it('error session sends error event on connect', async () => {
     analysisSessions.set('err-sse-session', {
       status: 'error',
+      uid: 'test-user',
       error: 'Analysis failed badly',
     });
 
@@ -918,6 +927,12 @@ describe('J. SSE Progress Format', () => {
   });
 
   it('client disconnect cleans up without crash', async () => {
+    // Create a session so ownership check passes
+    analysisSessions.set('disconnect-test', {
+      status: 'downloading',
+      uid: 'test-user',
+    });
+
     const sse = createSSEClient(`${baseUrl}/api/progress/disconnect-test`);
     await sse.waitForEvent('connected');
     sse.close();
@@ -1128,5 +1143,104 @@ describe('M. URL Cache TTL', () => {
 
     expect(body.status).toBe('cached');
     expect(body.sessionId).toBe(firstId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N. Session Ownership & Security
+// ---------------------------------------------------------------------------
+
+describe('N. Session Ownership & Security', () => {
+  it('session owned by another user returns 403', async () => {
+    analysisSessions.set('other-user-session', {
+      status: 'ready',
+      uid: 'other-user',
+      url: 'https://ok.ru/video/999',
+      title: 'Other User Video',
+      chunks: [],
+    });
+
+    const res = await fetch(`${baseUrl}/api/session/other-user-session`);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toMatch(/access denied/i);
+  });
+
+  it('session without uid returns 403', async () => {
+    analysisSessions.set('no-uid-session', {
+      status: 'ready',
+      url: 'https://ok.ru/video/888',
+      title: 'Legacy Session',
+      chunks: [],
+    });
+
+    const res = await fetch(`${baseUrl}/api/session/no-uid-session`);
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toMatch(/access denied/i);
+  });
+
+  it('POST /api/analyze returns UUID-format session ID', async () => {
+    setupHappyPathMocks();
+    const { sessionId } = await analyzeAndWait('https://ok.ru/video/uuid-test-' + Date.now());
+
+    // UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    expect(sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it('ownership enforced on DELETE', async () => {
+    analysisSessions.set('delete-other', {
+      status: 'ready',
+      uid: 'someone-else',
+      url: 'https://ok.ru/video/777',
+      title: 'Not yours',
+      chunks: [],
+    });
+
+    const res = await fetch(`${baseUrl}/api/session/delete-other`, { method: 'DELETE' });
+    expect(res.status).toBe(403);
+  });
+
+  it('ownership enforced on download-chunk', async () => {
+    analysisSessions.set('dl-other', {
+      status: 'ready',
+      uid: 'someone-else',
+      url: 'https://ok.ru/video/666',
+      title: 'Not yours',
+      chunks: [{ id: 'chunk-0', status: 'pending' }],
+    });
+
+    const res = await fetch(`${baseUrl}/api/download-chunk`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'dl-other', chunkId: 'chunk-0' }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('ownership enforced on SSE progress endpoint', async () => {
+    analysisSessions.set('sse-other', {
+      status: 'downloading',
+      uid: 'someone-else',
+    });
+
+    const res = await fetch(`${baseUrl}/api/progress/sse-other`);
+    expect(res.status).toBe(403);
+  });
+
+  it('per-user URL cache: same URL, different users get different sessions', async () => {
+    setupHappyPathMocks();
+
+    // First user analyzes
+    const { sessionId: firstId } = await analyzeAndWait('https://ok.ru/video/shared-url-' + Date.now());
+
+    // Verify cache has entry for test-user
+    expect(urlSessionCache.size).toBe(1);
+    const cacheKey = [...urlSessionCache.keys()][0];
+    expect(cacheKey).toMatch(/^test-user:/);
+
+    // Simulate a different user's cache entry for the same URL (should not collide)
+    const otherCacheKey = cacheKey.replace('test-user:', 'other-user:');
+    expect(urlSessionCache.has(otherCacheKey)).toBe(false);
   });
 });

@@ -8,6 +8,7 @@ on:
 
 jobs:
   test:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
       VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
@@ -67,7 +68,6 @@ jobs:
         run: npm run test:e2e
 
   deploy:
-    needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     concurrency:
@@ -84,6 +84,9 @@ jobs:
       VITE_FIREBASE_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
       VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
       VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
 
     steps:
       - uses: actions/checkout@v4
@@ -108,57 +111,10 @@ jobs:
       - name: Configure Docker for GCR
         run: gcloud auth configure-docker --quiet
 
-      - name: Get Cloud Run URL for frontend build
-        id: get-url
+      - name: Deploy
         run: |
-          # On first deploy, service won't exist yet — URL will be empty.
-          # This is fine: empty VITE_API_URL means the frontend uses relative
-          # URLs (same origin), which is correct when served from Cloud Run.
-          URL=$(gcloud run services describe russian-transcription \
-            --region us-central1 \
-            --format 'value(status.url)' 2>/dev/null || echo "")
-          echo "backend_url=$URL" >> $GITHUB_OUTPUT
-
-      - name: Build frontend
-        run: |
-          echo "VITE_API_URL=${{ steps.get-url.outputs.backend_url }}" > .env.production
-          npm run build
-
-      - name: Prepare server with frontend
-        run: cp -r dist server/
-
-      - name: Build and push Docker image
-        run: |
-          # Note: github-deploy SA has storage.admin which covers GCR image
-          # pull access for the base image (russian-base:latest)
-          IMAGE="gcr.io/russian-transcription/russian-transcription"
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          cd server
-          docker build --platform linux/amd64 \
-            -t $IMAGE:latest \
-            -t $IMAGE:${{ github.sha }} \
-            -t $IMAGE:$SHORT_SHA \
-            .
-          docker push $IMAGE:latest
-          docker push $IMAGE:${{ github.sha }}
-          docker push $IMAGE:$SHORT_SHA
-
-      - name: Deploy to Cloud Run
-        run: |
-          gcloud run deploy russian-transcription \
-            --image gcr.io/russian-transcription/russian-transcription:latest \
-            --region us-central1 \
-            --allow-unauthenticated \
-            --memory 1Gi \
-            --timeout 300 \
-            --max-instances 1 \
-            --set-secrets="OPENAI_API_KEY=openai-api-key:latest,GOOGLE_TRANSLATE_API_KEY=google-translate-key:latest" \
-            --set-env-vars="GCS_BUCKET=russian-transcription-videos"
-
-      - name: Verify deployment
-        run: |
-          URL=$(gcloud run services describe russian-transcription \
-            --region us-central1 \
-            --format 'value(status.url)')
-          echo "Deployed to: $URL"
-          curl -sf "$URL/api/health" || echo "Health check pending (cold start)"
+          chmod +x ./scripts/deploy.sh
+          ./scripts/deploy.sh
+        env:
+          GIT_SHA: ${{ github.sha }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}

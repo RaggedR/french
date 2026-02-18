@@ -3,14 +3,15 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js",
+    "start": "node --import ./instrument.mjs index.js",
+    "dev": "node --watch --import ./instrument.mjs index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "node test-media.js"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.14.0",
+    "@sentry/node": "^10.39.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.4",
     "express": "^4.21.2",

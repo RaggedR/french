@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Russian Video & Text — a web app for watching Russian videos (ok.ru) and reading Russian texts (lib.ru) with synced transcripts, click-to-translate, and SRS flashcard review. Users paste URLs; the backend downloads, transcribes (Whisper), punctuates (GPT-4o), and chunks the content. Words highlight in sync with playback. Users build a flashcard deck by clicking words, which persists to Firestore via anonymous auth.
+Russian Video & Text — a web app for watching Russian videos (ok.ru) and reading Russian texts (lib.ru) with synced transcripts, click-to-translate, and SRS flashcard review. Users paste URLs; the backend downloads, transcribes (Whisper), punctuates (GPT-4o), and chunks the content. Words highlight in sync with playback. Users build a flashcard deck by clicking words, which persists to Firestore via Google Sign-In auth.
 
 ## Commands
 
@@ -112,14 +112,28 @@ SSE for progress updates has a special setup to avoid Vite proxy buffering in de
 - **Local dev** (`IS_LOCAL=true`): In-memory Maps, videos in `server/temp/`, lost on restart. Controlled by absence of `GCS_BUCKET` env var or `NODE_ENV=development`.
 - **Production**: Sessions in `gs://russian-transcription-videos/sessions/`, videos in `videos/`, extraction cache in `cache/`
 - `chunkTranscripts` is a Map — serialized as `Array.from(map.entries())` for JSON/GCS storage, restored with `new Map(array)`
-- URL session cache (6h TTL), extraction cache (2h TTL), translation cache (in-memory)
+- URL session cache (6h TTL) is **per-user** — keyed as `${uid}:${normalizedUrl}`, so two users analyzing the same URL get independent sessions
+- Extraction cache (2h TTL), translation cache (in-memory, shared)
 
 ### Backend (`server/`)
 
-Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Three main files:
-- `index.js` — Routing, session management, SSE, chunk prefetching
+Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
+- `index.js` — Routing, session management, SSE, chunk prefetching, ownership middleware
 - `media.js` — External tool integration (yt-dlp, Whisper, GPT-4o, Google Translate, TTS)
 - `chunking.js` — Splits transcripts at natural pauses (>0.5s gaps), targets ~3min chunks
+- `auth.js` — Firebase Admin SDK token verification middleware (`requireAuth`)
+- `usage.js` — Per-user API cost tracking with daily/weekly/monthly limits
+
+**Authentication & Authorization:**
+- `requireAuth` middleware on all `/api/*` routes (except `/api/health`) — verifies Firebase ID tokens from `Authorization: Bearer` header or `?token=` query param (needed for SSE/EventSource). Sets `req.uid` and `req.userEmail`.
+- `requireSessionOwnership` middleware on all session endpoints — verifies `session.uid === req.uid`. Returns 403 for mismatched or missing uid. Attaches `req.session` and `req.sessionId` so handlers skip redundant lookups.
+- Session IDs are `crypto.randomUUID()` (122 bits of entropy, not guessable).
+
+**Rate Limiting & Budget:**
+- Per-user rate limiters keyed on `req.uid` (disabled during tests via `process.env.VITEST`)
+- OpenAI budget: $1/day, $5/week, $10/month per user (`requireBudget` middleware)
+- Google Translate budget: $0.50/day, $2.50/week, $5/month (`requireTranslateBudget`)
+- Costs tracked in-memory (resets on restart); see `server/usage.js` for per-call estimates
 
 **Key patterns in `media.js`:**
 - `addPunctuation()` uses a two-pointer algorithm to align GPT-4o's punctuated output back to original Whisper word timestamps
@@ -128,17 +142,20 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Three main files:
 
 **API Endpoints:**
 
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| GET | `/api/health` | Health check |
-| POST | `/api/analyze` | Start analysis (returns cached if URL seen before) |
-| GET | `/api/session/:sessionId` | Get session data + chunk statuses |
-| GET | `/api/session/:sessionId/chunk/:chunkId` | Get ready chunk's video URL + transcript |
-| POST | `/api/download-chunk` | Download a chunk (waits if prefetch in progress) |
-| POST | `/api/load-more-chunks` | Load next batch for long videos |
-| DELETE | `/api/session/:sessionId` | Delete session + all videos |
-| POST | `/api/translate` | Google Translate proxy with caching |
-| GET | `/api/progress/:sessionId` | SSE stream for progress events |
+| Method | Endpoint | Auth | Purpose |
+|--------|----------|------|---------|
+| GET | `/api/health` | — | Health check |
+| POST | `/api/analyze` | auth + budget | Start analysis (returns cached per-user if URL seen) |
+| GET | `/api/session/:sessionId` | auth + owner | Get session data + chunk statuses |
+| GET | `/api/session/:sessionId/chunk/:chunkId` | auth + owner | Get ready chunk's video URL + transcript |
+| POST | `/api/download-chunk` | auth + owner + budget | Download a chunk (waits if prefetch in progress) |
+| POST | `/api/load-more-chunks` | auth + owner | Load next batch for long videos |
+| DELETE | `/api/session/:sessionId` | auth + owner | Delete session + all videos |
+| POST | `/api/translate` | auth + translate budget | Google Translate proxy with caching |
+| POST | `/api/extract-sentence` | auth + budget | GPT-powered sentence extraction + translation |
+| GET | `/api/progress/:sessionId` | auth + owner | SSE stream for progress events |
+| GET | `/api/hls/:sessionId/playlist.m3u8` | auth + owner | Proxy and rewrite HLS manifest |
+| GET | `/api/hls/:sessionId/segment` | auth + owner | Proxy HLS segments |
 
 ### Frontend
 
@@ -162,14 +179,28 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Three main files:
 - `TranscriptPanel` underlines words in a configurable frequency rank range (e.g., rank 500–1000)
 - Normalization: ё→е for both frequency lookup and card deduplication (`normalizeCardId` in `sm2.ts`)
 
+### Error Monitoring (Sentry)
+
+- **Backend**: `server/instrument.mjs` initializes `@sentry/node` via `--import` flag (before any other code). `setupExpressErrorHandler(app)` catches unhandled route errors. `captureException` added to 5 critical catch blocks in `index.js` (analyze, download-chunk video/text, load-more-chunks, prefetch) and 2 in `usage.js` (persist, init).
+- **Frontend**: `src/sentry.ts` initializes `@sentry/react`. `Sentry.ErrorBoundary` wraps `<App>` in `main.tsx`. `api.ts` captures 500+ API errors.
+- **Source maps**: `@sentry/vite-plugin` uploads source maps during CI deploy (requires `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`). Build uses `sourcemap: 'hidden'` to avoid exposing maps in production.
+- **Config**: Enabled only when DSN is set (`SENTRY_DSN` for backend, `VITE_SENTRY_DSN` for frontend). No-op during tests (`VITEST` env / `VITE_E2E_TEST` flag). `tracesSampleRate: 0.2` (20% of transactions traced).
+- **GCP secret**: `sentry-dsn` in Secret Manager, mapped to `SENTRY_DSN` env var in Cloud Run.
+
+### CI/CD
+
+- **GitHub Actions** (`.github/workflows/ci.yml`): lint → build → vitest (frontend + server) → Playwright E2E on every PR. Auto-deploys to Cloud Run on merge to main via Workload Identity Federation.
+- Skips CI for docs-only changes (`.md`, `.txt`, `LICENSE`).
+
 ### Deployment
 
-GCP project: `book-friend-finder`, Cloud Run service: `russian-transcription`, region: `us-central1`.
+GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`, region: `us-central1`.
 
-- `./deploy.sh` — Full deploy with secrets, GCS bucket setup, lifecycle policies
-- `./quick-deploy.sh` — Fast local Docker build + push (`npm run build` → copy dist to server → docker build → push → `gcloud run deploy`)
+- **Primary**: Merge to `main` → GitHub Actions builds Docker image, pushes to GCR, deploys to Cloud Run
+- `./deploy.sh` — Manual full deploy with secrets, GCS bucket setup, lifecycle policies
+- `./quick-deploy.sh` — Manual fast local Docker build + push
 - `server/Dockerfile` — Extends `russian-base:latest` (node:20-slim + ffmpeg + yt-dlp, built by `build-base.sh`)
-- Frontend hosted from Cloud Run (dist copied into Docker image), not Firebase Hosting in production
+- Frontend hosted from Cloud Run (dist copied into Docker image), not Firebase Hosting
 
 ## Tech Stack
 
@@ -193,29 +224,24 @@ GCP project: `book-friend-finder`, Cloud Run service: `russian-transcription`, r
 
 ## Production Roadmap
 
-### Authentication & Payment (Priority: HIGH)
-- ~~Migrate from Firebase Anonymous Auth to Google OAuth~~ (DONE — PR #8)
-- ~~Per-user rate limiting + cost tracking~~ (DONE — PR #8)
+### Completed
+- ~~Migrate from Firebase Anonymous Auth to Google OAuth~~ (PR #8)
+- ~~Per-user rate limiting + cost tracking~~ (PR #8)
+- ~~CI/CD: GitHub Actions for lint, test, deploy~~ (PR #15)
+- ~~Session security: crypto.randomUUID(), session ownership, access validation~~
+
+### Payment (Priority: HIGH)
 - Add Stripe subscription: $10/month, first month free
-- Android app planned (React Native or PWA wrapper)
 - Track per-user API usage (Whisper minutes, translations, TTS calls)
 - Enforce usage quotas per tier (free trial vs paid)
 
-### Session Security
-- Replace timestamp-based session IDs with crypto.randomUUID()
-- Add session ownership (tie sessions to authenticated user)
-- Validate session access (users can only access their own sessions)
-
 ### Monitoring & Error Tracking
-- Add Sentry or equivalent for error alerting
+- ~~Add Sentry or equivalent for error alerting~~
 - Cloud Run error rate alerts via GCP Monitoring
-- Track API costs per user for billing decisions
 
 ### Data Persistence
 - Server-side deck backup (currently localStorage + Firestore)
 - Export/import deck functionality
 
-### CI/CD
-- Add `node --check server/index.js` to deploy.sh (prevent syntax crashes)
-- Add `npm test` to deploy.sh before deploying
-- Consider GitHub Actions for automated testing on push
+### Mobile
+- Android app (React Native or PWA wrapper)

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
@@ -9,10 +10,11 @@ import dotenv from 'dotenv';
 import { Storage } from '@google-cloud/storage';
 import { spawn } from 'child_process';
 import rateLimit from 'express-rate-limit';
+import * as Sentry from '@sentry/node';
 import { createChunks, createTextChunks, getChunkTranscript, formatTime } from './chunking.js';
 import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps } from './media.js';
 import { requireAuth } from './auth.js';
-import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget } from './usage.js';
+import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget, initUsageStore } from './usage.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -151,41 +153,43 @@ function normalizeUrl(url) {
 }
 
 /**
- * Check if we have a cached session for this URL
+ * Check if we have a cached session for this URL and user
  */
-async function getCachedSession(url) {
+async function getCachedSession(url, uid) {
   const normalizedUrl = normalizeUrl(url);
-  const cached = urlSessionCache.get(normalizedUrl);
+  const cacheKey = `${uid}:${normalizedUrl}`;
+  const cached = urlSessionCache.get(cacheKey);
 
   if (!cached) return null;
 
   // Check if cache entry is expired
   if (Date.now() - cached.timestamp > URL_CACHE_TTL) {
-    urlSessionCache.delete(normalizedUrl);
+    urlSessionCache.delete(cacheKey);
     return null;
   }
 
   // Verify session still exists
   const session = await getAnalysisSession(cached.sessionId);
   if (!session || session.status !== 'ready') {
-    urlSessionCache.delete(normalizedUrl);
+    urlSessionCache.delete(cacheKey);
     return null;
   }
 
-  console.log(`[Cache] Found cached session ${cached.sessionId} for ${normalizedUrl}`);
+  console.log(`[Cache] Found cached session ${cached.sessionId} for ${cacheKey}`);
   return { sessionId: cached.sessionId, session };
 }
 
 /**
- * Cache a session for a URL
+ * Cache a session for a URL + user combination
  */
-function cacheSessionUrl(url, sessionId) {
+function cacheSessionUrl(url, sessionId, uid) {
   const normalizedUrl = normalizeUrl(url);
-  urlSessionCache.set(normalizedUrl, {
+  const cacheKey = `${uid}:${normalizedUrl}`;
+  urlSessionCache.set(cacheKey, {
     sessionId,
     timestamp: Date.now(),
   });
-  console.log(`[Cache] Cached session ${sessionId} for ${normalizedUrl}`);
+  console.log(`[Cache] Cached session ${sessionId} for ${cacheKey}`);
 }
 
 /**
@@ -385,9 +389,9 @@ async function rebuildUrlCache() {
       try {
         const [contents] = await file.download();
         const session = JSON.parse(contents.toString());
-        if (session.status === 'ready' && session.url) {
+        if (session.status === 'ready' && session.url && session.uid) {
           const sessionId = file.name.replace('sessions/', '').replace('.json', '');
-          cacheSessionUrl(session.url, sessionId);
+          cacheSessionUrl(session.url, sessionId, session.uid);
           cached++;
         }
       } catch {
@@ -478,6 +482,26 @@ const extractSentenceRateLimit = rateLimit({
   legacyHeaders: false,
   skip: skipInTest,
 });
+
+/**
+ * Middleware: verify the requesting user owns the session.
+ * Loads the session and attaches it as req.session / req.sessionId so
+ * downstream handlers don't need to call getAnalysisSession() again.
+ */
+async function requireSessionOwnership(req, res, next) {
+  const sessionId = req.params.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'Session ID is required' });
+
+  const session = await getAnalysisSession(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  if (!session.uid || session.uid !== req.uid) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  req.session = session;
+  req.sessionId = sessionId;
+  next();
+}
 
 // Translation cache (in-memory for simplicity, could use Redis in production)
 const translationCache = new Map();
@@ -602,8 +626,8 @@ app.post('/api/extract-sentence', extractSentenceRateLimit, requireBudget, async
  * DELETE /api/session/:sessionId
  * Delete a session and all its associated videos from storage
  */
-app.delete('/api/session/:sessionId', async (req, res) => {
-  const { sessionId } = req.params;
+app.delete('/api/session/:sessionId', requireSessionOwnership, async (req, res) => {
+  const { sessionId } = req;
 
   try {
     await deleteSessionAndVideos(sessionId);
@@ -702,10 +726,10 @@ app.get('/api/local-audio/:filename', (req, res) => {
  * GET /api/hls/:sessionId/playlist.m3u8
  * Proxy and rewrite HLS manifest
  */
-app.get('/api/hls/:sessionId/playlist.m3u8', async (req, res) => {
-  const session = await getSession(req.params.sessionId);
-  if (!session || !session.hlsUrl) {
-    return res.status(404).json({ error: 'Session not found' });
+app.get('/api/hls/:sessionId/playlist.m3u8', requireSessionOwnership, async (req, res) => {
+  const session = req.session;
+  if (!session.hlsUrl) {
+    return res.status(404).json({ error: 'HLS URL not found for session' });
   }
 
   try {
@@ -752,7 +776,7 @@ app.get('/api/hls/:sessionId/playlist.m3u8', async (req, res) => {
  * GET /api/hls/:sessionId/segment
  * Proxy HLS segments
  */
-app.get('/api/hls/:sessionId/segment', async (req, res) => {
+app.get('/api/hls/:sessionId/segment', requireSessionOwnership, async (req, res) => {
   const { url } = req.query;
   if (!url) {
     return res.status(400).json({ error: 'URL required' });
@@ -912,8 +936,8 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
     return res.status(500).json({ error: 'Transcription service not configured' });
   }
 
-  // Check if we have a cached session for this URL
-  const cached = await getCachedSession(url);
+  // Check if we have a cached session for this URL + user
+  const cached = await getCachedSession(url, req.uid);
   if (cached) {
     console.log(`[Analyze] Returning cached session ${cached.sessionId} for URL`);
     return res.json({
@@ -927,7 +951,7 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
     });
   }
 
-  const sessionId = Date.now().toString();
+  const sessionId = crypto.randomUUID();
   const tempDir = path.join(__dirname, 'temp');
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
@@ -983,6 +1007,7 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
         await setAnalysisSession(sessionId, {
           status: 'ready',
           url,
+          uid,
           title: displayTitle,
           contentType: 'text',
           chunks,
@@ -992,7 +1017,7 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
           chunkTranscripts: new Map(),
         });
 
-        cacheSessionUrl(url, sessionId);
+        cacheSessionUrl(url, sessionId, uid);
 
         sendProgress(sessionId, 'complete', 100, 'complete', 'Text ready', {
           title: displayTitle,
@@ -1120,6 +1145,7 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
       await setAnalysisSession(sessionId, {
         status: 'ready',
         url,
+        uid,
         title,
         contentType: 'video',
         transcript,
@@ -1131,7 +1157,7 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
       });
 
       // Cache the URL -> session mapping for fast re-access
-      cacheSessionUrl(url, sessionId);
+      cacheSessionUrl(url, sessionId, uid);
 
       // Send completion event
       sendProgress(sessionId, 'complete', 100, 'complete', 'Analysis complete', {
@@ -1143,9 +1169,11 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
 
     } catch (error) {
       console.error(`[Analyze] Session ${sessionId} error:`, error);
+      Sentry.captureException(error, { tags: { operation: 'analyze', sessionId } });
 
       await setAnalysisSession(sessionId, {
         status: 'error',
+        uid,
         error: error.message,
       });
 
@@ -1160,16 +1188,12 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
  * Request: { sessionId }
  * Returns: { chunks: [...new chunks...], hasMoreChunks }
  */
-app.post('/api/load-more-chunks', loadMoreRateLimit, async (req, res) => {
-  const { sessionId } = req.body;
+app.post('/api/load-more-chunks', loadMoreRateLimit, requireSessionOwnership, async (req, res) => {
+  const { sessionId } = req;
+  const session = req.session;
 
   console.log(`[LoadMore] Request for session ${sessionId}`);
 
-  const session = await getAnalysisSession(sessionId);
-  if (!session) {
-    console.log(`[LoadMore] Session ${sessionId} not found`);
-    return res.status(404).json({ error: 'Session not found. Please re-analyze the video.' });
-  }
   if (session.status !== 'ready') {
     console.log(`[LoadMore] Session ${sessionId} not ready, status: ${session.status}`);
     return res.status(404).json({ error: 'Session not ready' });
@@ -1280,6 +1304,7 @@ app.post('/api/load-more-chunks', loadMoreRateLimit, async (req, res) => {
 
   } catch (error) {
     console.error(`[LoadMore] Session ${sessionId} error:`, error);
+    Sentry.captureException(error, { tags: { operation: 'load_more_chunks', sessionId } });
 
     if (fs.existsSync(audioPath)) {
       fs.unlinkSync(audioPath);
@@ -1294,8 +1319,8 @@ app.post('/api/load-more-chunks', loadMoreRateLimit, async (req, res) => {
  * GET /api/progress/:sessionId
  * Server-Sent Events for real-time progress updates
  */
-app.get('/api/progress/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
+app.get('/api/progress/:sessionId', requireSessionOwnership, (req, res) => {
+  const { sessionId } = req;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1451,11 +1476,8 @@ function sendProgress(sessionId, type, progress, status, message, extra = {}) {
  * GET /api/session/:sessionId
  * Get session data including chunk status
  */
-app.get('/api/session/:sessionId', async (req, res) => {
-  const session = await getAnalysisSession(req.params.sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found. Please re-analyze the video.' });
-  }
+app.get('/api/session/:sessionId', requireSessionOwnership, async (req, res) => {
+  const session = req.session;
 
   if (session.status === 'ready') {
     // Return chunks with their current status (pending/downloading/ready)
@@ -1497,12 +1519,12 @@ app.get('/api/session/:sessionId', async (req, res) => {
  * Get chunk video URL and transcript (if ready)
  * Returns: { videoUrl, transcript, title }
  */
-app.get('/api/session/:sessionId/chunk/:chunkId', async (req, res) => {
-  const { sessionId, chunkId } = req.params;
+app.get('/api/session/:sessionId/chunk/:chunkId', requireSessionOwnership, async (req, res) => {
+  const { chunkId } = req.params;
+  const session = req.session;
 
-  const session = await getAnalysisSession(sessionId);
-  if (!session || session.status !== 'ready') {
-    return res.status(404).json({ error: 'Session not found or not ready. Please re-analyze the video.' });
+  if (session.status !== 'ready') {
+    return res.status(404).json({ error: 'Session not ready. Please re-analyze the video.' });
   }
 
   const chunk = session.chunks.find(c => c.id === chunkId);
@@ -1541,12 +1563,13 @@ app.get('/api/session/:sessionId/chunk/:chunkId', async (req, res) => {
  * Request: { sessionId, chunkId, startTime, endTime }
  * Returns: { videoUrl, transcript }
  */
-app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, async (req, res) => {
-  const { sessionId, chunkId } = req.body;
+app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, requireSessionOwnership, async (req, res) => {
+  const { chunkId } = req.body;
+  const { sessionId } = req;
+  const session = req.session;
 
-  const session = await getAnalysisSession(sessionId);
-  if (!session || session.status !== 'ready') {
-    return res.status(404).json({ error: 'Session not found or not ready. Please re-analyze the video.' });
+  if (session.status !== 'ready') {
+    return res.status(404).json({ error: 'Session not ready. Please re-analyze the video.' });
   }
 
   // Find the chunk in session
@@ -1664,6 +1687,7 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, async (re
 
     } catch (error) {
       console.error(`[Download-Chunk] Text mode error:`, error);
+      Sentry.captureException(error, { tags: { operation: 'download_chunk_text', sessionId, chunkId } });
       chunk.status = 'pending';
       if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
       const msg = friendlyErrorMessage(error.message);
@@ -1763,6 +1787,7 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, async (re
 
   } catch (error) {
     console.error(`[Download-Chunk] Error:`, error);
+    Sentry.captureException(error, { tags: { operation: 'download_chunk_video', sessionId, chunkId } });
 
     // Mark chunk as pending again on error
     chunk.status = 'pending';
@@ -1895,8 +1920,12 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
     console.log(`[Prefetch] Completed ${nextChunk.id} (${(videoSize / 1024 / 1024).toFixed(1)} MB)`);
   } catch (err) {
     console.error(`[Prefetch] Error:`, err.message);
+    Sentry.captureException(err, { tags: { operation: 'prefetch', sessionId } });
   }
 }
+
+// Sentry error handler — must be after all routes but before static file serving
+Sentry.setupExpressErrorHandler(app);
 
 // Serve static frontend files in production
 const distPath = path.join(__dirname, 'dist');
@@ -1917,11 +1946,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     console.log(`OpenAI API key: ${process.env.OPENAI_API_KEY ? 'loaded from .env' : 'not set'}`);
     console.log(`Google API key: ${process.env.GOOGLE_TRANSLATE_API_KEY ? 'loaded from .env' : 'not set'}`);
 
-    // Run cleanup then rebuild URL cache on startup (non-blocking)
+    // Run cleanup, rebuild URL cache, then hydrate usage data on startup (non-blocking)
     cleanupOldSessions()
       .then(() => rebuildUrlCache())
+      .then(() => initUsageStore())
       .catch(err => {
-        console.error('[Startup] Cleanup/cache rebuild failed:', err.message);
+        console.error('[Startup] Cleanup/cache/usage rebuild failed:', err.message);
       });
   });
 }

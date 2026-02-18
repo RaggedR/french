@@ -1,7 +1,9 @@
 /**
  * Per-user API cost tracker (daily / weekly / monthly limits).
  *
- * Tracks estimated costs in-memory (resets on server restart).
+ * In-memory Maps serve as primary store (fast synchronous reads for middleware).
+ * A write-behind cache persists to Firestore with 5s debounce per user.
+ * On startup, initUsageStore() hydrates Maps from Firestore.
  *
  * OpenAI limits:    $1/day, $5/week, $10/month
  * Translate limits: $0.50/day, $2.50/week, $5/month
@@ -13,6 +15,9 @@
  *   TTS:               $15 / 1M characters
  *   Google Translate:   $20 / 1M characters
  */
+
+import { getFirestore } from 'firebase-admin/firestore';
+import * as Sentry from '@sentry/node';
 
 const DAILY_LIMIT = 1.00;    // $1/day per user
 const WEEKLY_LIMIT = 5.00;   // $5/week per user
@@ -31,6 +36,91 @@ const monthlyCosts = new Map();
 const translateDailyCosts = new Map();
 const translateWeeklyCosts = new Map();
 const translateMonthlyCosts = new Map();
+
+// --- Firestore persistence (write-behind cache) ----------------------------
+
+let db = null;
+
+/** Lazy-init Firestore so tests can run without Firebase credentials. */
+function getDb() {
+  if (!db) {
+    try { db = getFirestore(); } catch { /* tests / local without credentials */ }
+  }
+  return db;
+}
+
+const PERSIST_DEBOUNCE_MS = 5000;
+const persistTimers = new Map();
+
+/**
+ * Debounced write of a user's cost data to Firestore.
+ * Multiple trackCost calls within 5s produce a single write.
+ */
+function persistUsage(uid) {
+  if (persistTimers.has(uid)) clearTimeout(persistTimers.get(uid));
+  persistTimers.set(uid, setTimeout(async () => {
+    persistTimers.delete(uid);
+    const firestore = getDb();
+    if (!firestore) return;
+    try {
+      await firestore.collection('usage').doc(uid).set({
+        openai: {
+          daily: dailyCosts.get(uid) || null,
+          weekly: weeklyCosts.get(uid) || null,
+          monthly: monthlyCosts.get(uid) || null,
+        },
+        translate: {
+          daily: translateDailyCosts.get(uid) || null,
+          weekly: translateWeeklyCosts.get(uid) || null,
+          monthly: translateMonthlyCosts.get(uid) || null,
+        },
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error(`[Usage] Persist failed for ${uid}:`, err.message);
+      Sentry.captureException(err, { tags: { operation: 'usage_persist', uid }, level: 'warning' });
+    }
+  }, PERSIST_DEBOUNCE_MS));
+}
+
+/**
+ * Hydrate in-memory Maps from Firestore on startup.
+ * Skips expired period data (stale days/weeks/months).
+ */
+export async function initUsageStore() {
+  const firestore = getDb();
+  if (!firestore) {
+    console.log('[Usage] No Firestore, in-memory only');
+    return;
+  }
+  try {
+    // Only load docs updated this month (longest tracked period) to avoid full table scan
+    const monthStart = getMonth() + '-01T00:00:00.000Z';
+    const snapshot = await firestore.collection('usage')
+      .where('updatedAt', '>=', monthStart)
+      .get();
+    let loaded = 0;
+    const today = getToday();
+    const week = getWeek();
+    const month = getMonth();
+
+    for (const doc of snapshot.docs) {
+      const uid = doc.id;
+      const data = doc.data();
+      if (data.openai?.daily?.date === today) dailyCosts.set(uid, data.openai.daily);
+      if (data.openai?.weekly?.week === week) weeklyCosts.set(uid, data.openai.weekly);
+      if (data.openai?.monthly?.month === month) monthlyCosts.set(uid, data.openai.monthly);
+      if (data.translate?.daily?.date === today) translateDailyCosts.set(uid, data.translate.daily);
+      if (data.translate?.weekly?.week === week) translateWeeklyCosts.set(uid, data.translate.weekly);
+      if (data.translate?.monthly?.month === month) translateMonthlyCosts.set(uid, data.translate.monthly);
+      loaded++;
+    }
+    console.log(`[Usage] Loaded cost data for ${loaded} users`);
+  } catch (err) {
+    console.error('[Usage] Failed to load from Firestore:', err.message);
+    Sentry.captureException(err, { tags: { operation: 'usage_init' }, level: 'error' });
+  }
+}
 
 function getToday() {
   return new Date().toISOString().slice(0, 10);
@@ -94,6 +184,8 @@ export function trackCost(uid, amount) {
   } else {
     monthly.cost += amount;
   }
+
+  persistUsage(uid);
 }
 
 export function getRemainingBudget(uid) {
@@ -148,6 +240,8 @@ export function trackTranslateCost(uid, amount) {
   } else {
     monthly.cost += amount;
   }
+
+  persistUsage(uid);
 }
 
 export function requireTranslateBudget(req, res, next) {

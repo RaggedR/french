@@ -1,4 +1,5 @@
 import type { ProgressState, VideoChunk, SessionResponse, ChunkResponse, LoadMoreResponse } from '../types';
+import * as Sentry from '@sentry/react';
 import { auth } from '../firebase';
 
 // API base URL - uses environment variable in production, relative path in development
@@ -45,7 +46,11 @@ export async function apiRequest<T>(
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `Request failed: ${response.status}`);
+    const error = new Error(data.error || `Request failed: ${response.status}`);
+    if (response.status >= 500) {
+      Sentry.captureException(error, { tags: { endpoint, status: String(response.status) } });
+    }
+    throw error;
   }
 
   return response.json();
