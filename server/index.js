@@ -101,9 +101,10 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(helmet({
-  contentSecurityPolicy: false,      // Vite-built React app uses inline scripts; custom CSP TBD
-  crossOriginEmbedderPolicy: false,  // Firebase SDK + Google Sign-In load from CDN
-  crossOriginOpenerPolicy: false,    // Google Sign-In uses signInWithPopup (cross-origin window.open)
+  contentSecurityPolicy: false,       // Vite-built React app uses inline scripts; custom CSP TBD
+  crossOriginEmbedderPolicy: false,   // Firebase SDK + Google Sign-In load from CDN
+  crossOriginOpenerPolicy: false,     // Google Sign-In uses signInWithPopup (cross-origin window.open)
+  crossOriginResourcePolicy: false,   // Firebase JS SDK loaded from cross-origin CDN
 }));
 app.use(cors({
   origin: [
