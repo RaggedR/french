@@ -150,7 +150,7 @@ export function TranscriptPanel({
         setIsTranslating(false);
       }
     },
-    [transcript.segments]
+    [transcript.words]
   );
 
   const handleClosePopup = useCallback(() => {

@@ -13,6 +13,15 @@ import {
   requireBudget,
   trackTranslateCost,
   requireTranslateBudget,
+  getTranslateDailyCost,
+  getTranslateWeeklyCost,
+  getTranslateMonthlyCost,
+  DAILY_LIMIT,
+  WEEKLY_LIMIT,
+  MONTHLY_LIMIT,
+  TRANSLATE_DAILY_LIMIT,
+  TRANSLATE_WEEKLY_LIMIT,
+  TRANSLATE_MONTHLY_LIMIT,
   costs,
 } from './usage.js';
 
@@ -340,6 +349,54 @@ describe('usage.js', () => {
       expect(wasNextCalled()).toBe(false);
       expect(res.statusCode).toBe(429);
       expect(res.body.error).toContain('Monthly translation');
+    });
+  });
+
+  // --- Limit constants --------------------------------------------------------
+
+  describe('exported limit constants', () => {
+    it('exports OpenAI limits', () => {
+      expect(DAILY_LIMIT).toBe(1.00);
+      expect(WEEKLY_LIMIT).toBe(5.00);
+      expect(MONTHLY_LIMIT).toBe(10.00);
+    });
+
+    it('exports Translate limits', () => {
+      expect(TRANSLATE_DAILY_LIMIT).toBe(0.50);
+      expect(TRANSLATE_WEEKLY_LIMIT).toBe(2.50);
+      expect(TRANSLATE_MONTHLY_LIMIT).toBe(5.00);
+    });
+  });
+
+  // --- Translate getter functions --------------------------------------------
+
+  describe('getTranslateDailyCost / getTranslateWeeklyCost / getTranslateMonthlyCost', () => {
+    it('returns 0 for unknown user', () => {
+      expect(getTranslateDailyCost('nonexistent')).toBe(0);
+      expect(getTranslateWeeklyCost('nonexistent')).toBe(0);
+      expect(getTranslateMonthlyCost('nonexistent')).toBe(0);
+    });
+
+    it('tracks and retrieves translate costs across all periods', () => {
+      trackTranslateCost(uid, 0.05);
+      trackTranslateCost(uid, 0.03);
+      expect(getTranslateDailyCost(uid)).toBeCloseTo(0.08, 5);
+      expect(getTranslateWeeklyCost(uid)).toBeCloseTo(0.08, 5);
+      expect(getTranslateMonthlyCost(uid)).toBeCloseTo(0.08, 5);
+    });
+
+    it('resets daily translate cost on new day but keeps weekly/monthly', () => {
+      vi.useFakeTimers();
+      // Use Monday → Tuesday (same ISO week, same month)
+      vi.setSystemTime(new Date('2026-03-16T10:00:00Z')); // Monday
+      trackTranslateCost(uid, 0.20);
+      expect(getTranslateDailyCost(uid)).toBeCloseTo(0.20);
+
+      // Advance to next day (Tuesday — still same ISO week and month)
+      vi.setSystemTime(new Date('2026-03-17T10:00:00Z'));
+      expect(getTranslateDailyCost(uid)).toBe(0);
+      expect(getTranslateWeeklyCost(uid)).toBeCloseTo(0.20);
+      expect(getTranslateMonthlyCost(uid)).toBeCloseTo(0.20);
     });
   });
 

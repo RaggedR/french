@@ -19,13 +19,13 @@
 import { getFirestore } from 'firebase-admin/firestore';
 import * as Sentry from '@sentry/node';
 
-const DAILY_LIMIT = 1.00;    // $1/day per user
-const WEEKLY_LIMIT = 5.00;   // $5/week per user
-const MONTHLY_LIMIT = 10.00; // $10/month per user
+export const DAILY_LIMIT = 1.00;    // $1/day per user
+export const WEEKLY_LIMIT = 5.00;   // $5/week per user
+export const MONTHLY_LIMIT = 10.00; // $10/month per user
 
-const TRANSLATE_DAILY_LIMIT = 0.50;
-const TRANSLATE_WEEKLY_LIMIT = 2.50;
-const TRANSLATE_MONTHLY_LIMIT = 5.00;
+export const TRANSLATE_DAILY_LIMIT = 0.50;
+export const TRANSLATE_WEEKLY_LIMIT = 2.50;
+export const TRANSLATE_MONTHLY_LIMIT = 5.00;
 
 // OpenAI: uid -> { cost, date/week/month }
 const dailyCosts = new Map();
@@ -215,6 +215,24 @@ export function requireBudget(req, res, next) {
 }
 
 // --- Google Translate -------------------------------------------------------
+
+export function getTranslateDailyCost(uid) {
+  const entry = translateDailyCosts.get(uid);
+  if (!entry || entry.date !== getToday()) return 0;
+  return entry.cost;
+}
+
+export function getTranslateWeeklyCost(uid) {
+  const entry = translateWeeklyCosts.get(uid);
+  if (!entry || entry.week !== getWeek()) return 0;
+  return entry.cost;
+}
+
+export function getTranslateMonthlyCost(uid) {
+  const entry = translateMonthlyCosts.get(uid);
+  if (!entry || entry.month !== getMonth()) return 0;
+  return entry.cost;
+}
 
 export function trackTranslateCost(uid, amount) {
   const today = getToday();

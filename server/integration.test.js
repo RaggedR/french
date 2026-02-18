@@ -20,6 +20,9 @@ vi.mock('./auth.js', () => ({
     req.userEmail = 'test@example.com';
     next();
   },
+  adminAuth: {
+    deleteUser: vi.fn().mockResolvedValue(undefined),
+  },
 }));
 
 // ---------------------------------------------------------------------------
@@ -32,10 +35,20 @@ vi.mock('./usage.js', () => ({
   requireTranslateBudget: (req, res, next) => next(),
   trackCost: () => {},
   trackTranslateCost: () => {},
-  getUserCost: () => 0,
-  getUserWeeklyCost: () => 0,
-  getUserMonthlyCost: () => 0,
+  getUserCost: () => 0.45,
+  getUserWeeklyCost: () => 1.20,
+  getUserMonthlyCost: () => 3.50,
+  getTranslateDailyCost: () => 0.10,
+  getTranslateWeeklyCost: () => 0.40,
+  getTranslateMonthlyCost: () => 1.00,
   getRemainingBudget: () => 1,
+  initUsageStore: vi.fn().mockResolvedValue(undefined),
+  DAILY_LIMIT: 1.00,
+  WEEKLY_LIMIT: 5.00,
+  MONTHLY_LIMIT: 10.00,
+  TRANSLATE_DAILY_LIMIT: 0.50,
+  TRANSLATE_WEEKLY_LIMIT: 2.50,
+  TRANSLATE_MONTHLY_LIMIT: 5.00,
   costs: {
     whisper: () => 0,
     gpt4o: () => 0,
@@ -1437,5 +1450,76 @@ describe('P. Concurrency Limit on /api/analyze', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe('cached');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Q. GET /api/usage
+// ---------------------------------------------------------------------------
+
+describe('Q. GET /api/usage', () => {
+  it('returns usage data with correct shape', async () => {
+    const res = await fetch(`${baseUrl}/api/usage`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // OpenAI buckets
+    expect(body.openai).toBeDefined();
+    expect(body.openai.daily).toEqual({ used: 0.45, limit: 1.00 });
+    expect(body.openai.weekly).toEqual({ used: 1.20, limit: 5.00 });
+    expect(body.openai.monthly).toEqual({ used: 3.50, limit: 10.00 });
+
+    // Translate buckets
+    expect(body.translate).toBeDefined();
+    expect(body.translate.daily).toEqual({ used: 0.10, limit: 0.50 });
+    expect(body.translate.weekly).toEqual({ used: 0.40, limit: 2.50 });
+    expect(body.translate.monthly).toEqual({ used: 1.00, limit: 5.00 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R. DELETE /api/account
+// ---------------------------------------------------------------------------
+
+describe('R. DELETE /api/account', () => {
+  it('cleans up in-memory sessions owned by the user', async () => {
+    // Set up sessions: one owned by test-user, one by someone else
+    analysisSessions.set('my-session', {
+      status: 'ready',
+      uid: 'test-user',
+      url: 'https://ok.ru/video/mine',
+      title: 'My Video',
+      chunks: [],
+    });
+    analysisSessions.set('other-session', {
+      status: 'ready',
+      uid: 'other-user',
+      url: 'https://ok.ru/video/theirs',
+      title: 'Their Video',
+      chunks: [],
+    });
+    // Set up a URL cache entry for our user
+    urlSessionCache.set('test-user:ok.ru/video/mine', { sessionId: 'my-session', timestamp: Date.now() });
+    urlSessionCache.set('other-user:ok.ru/video/theirs', { sessionId: 'other-session', timestamp: Date.now() });
+
+    const res = await fetch(`${baseUrl}/api/account`, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+
+    // Our session should be gone, other user's should remain
+    expect(analysisSessions.has('my-session')).toBe(false);
+    expect(analysisSessions.has('other-session')).toBe(true);
+
+    // URL cache should be cleaned for our user
+    expect(urlSessionCache.has('test-user:ok.ru/video/mine')).toBe(false);
+    expect(urlSessionCache.has('other-user:ok.ru/video/theirs')).toBe(true);
+  });
+
+  it('returns 200 even with no sessions to clean', async () => {
+    const res = await fetch(`${baseUrl}/api/account`, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
   });
 });

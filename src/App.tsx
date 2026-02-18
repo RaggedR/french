@@ -12,7 +12,7 @@ import { ReviewPanel } from './components/ReviewPanel';
 import { LoginScreen } from './components/LoginScreen';
 import { useDeck } from './hooks/useDeck';
 import { useAuth } from './hooks/useAuth';
-import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk, loadMoreChunks } from './services/api';
+import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk, loadMoreChunks, deleteAccount } from './services/api';
 import type {
   TranslatorConfig,
   AppView,
@@ -99,6 +99,23 @@ function FrequencyControls({ config, onConfigChange }: {
         </div>
       )}
     </div>
+  );
+}
+
+/** Render error text with clickable URL links (safe alternative to dangerouslySetInnerHTML) */
+function ErrorMessage({ text }: { text: string }) {
+  // split with capture group: even indices = text, odd indices = URL matches
+  const parts = text.split(/(https?:\/\/[^\s]+)/g);
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="underline font-medium hover:text-red-900">{part}</a>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </>
   );
 }
 
@@ -608,6 +625,11 @@ function App() {
     }
   }, [sessionId, isLoadingMore]);
 
+  const handleDeleteAccount = useCallback(async () => {
+    await deleteAccount();
+    signOut();
+  }, [signOut]);
+
   const handleReset = useCallback(() => {
     // Clean up SSE subscription
     if (progressCleanupRef.current) {
@@ -790,12 +812,9 @@ function App() {
           <div className="space-y-6">
             {error && (
               <div className="max-w-md mx-auto p-4 bg-red-50 border border-red-200 rounded-lg">
-                <p className="text-red-700 text-sm" dangerouslySetInnerHTML={{
-                  __html: error.replace(
-                    /(https:\/\/[^\s]+)/g,
-                    '<a href="$1" target="_blank" rel="noopener noreferrer" class="underline font-medium hover:text-red-900">$1</a>'
-                  )
-                }} />
+                <p className="text-red-700 text-sm">
+                  <ErrorMessage text={error} />
+                </p>
               </div>
             )}
             <ChunkMenu
@@ -967,6 +986,9 @@ function App() {
         onConfigChange={setConfig}
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
+        cards={cards}
+        userId={userId}
+        onDeleteAccount={handleDeleteAccount}
       />
 
       {/* Review panel */}

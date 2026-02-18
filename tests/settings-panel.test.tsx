@@ -3,6 +3,14 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { SettingsPanel } from '../src/components/SettingsPanel';
 import type { TranslatorConfig } from '../src/types';
 
+// Mock api module to prevent actual network calls
+vi.mock('../src/services/api', () => ({
+  getUsage: vi.fn().mockResolvedValue({
+    openai: { daily: { used: 0, limit: 1 }, weekly: { used: 0, limit: 5 }, monthly: { used: 0, limit: 10 } },
+    translate: { daily: { used: 0, limit: 0.5 }, weekly: { used: 0, limit: 2.5 }, monthly: { used: 0, limit: 5 } },
+  }),
+}));
+
 const DEFAULT_CONFIG: TranslatorConfig = {
   freqRangeMin: undefined,
   freqRangeMax: undefined,
@@ -15,6 +23,9 @@ function renderPanel(overrides: Partial<Parameters<typeof SettingsPanel>[0]> = {
       onConfigChange={overrides.onConfigChange ?? vi.fn()}
       isOpen={'isOpen' in overrides ? overrides.isOpen! : true}
       onClose={overrides.onClose ?? vi.fn()}
+      cards={overrides.cards ?? []}
+      userId={overrides.userId ?? null}
+      onDeleteAccount={overrides.onDeleteAccount ?? vi.fn().mockResolvedValue(undefined)}
     />
   );
 }

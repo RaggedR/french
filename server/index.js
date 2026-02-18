@@ -11,10 +11,11 @@ import { Storage } from '@google-cloud/storage';
 import { spawn } from 'child_process';
 import rateLimit from 'express-rate-limit';
 import * as Sentry from '@sentry/node';
+import { LRUCache } from 'lru-cache';
 import { createChunks, createTextChunks, getChunkTranscript, formatTime } from './chunking.js';
 import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps } from './media.js';
-import { requireAuth } from './auth.js';
-import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget, initUsageStore } from './usage.js';
+import { requireAuth, adminAuth } from './auth.js';
+import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget, initUsageStore, getUserCost, getUserWeeklyCost, getUserMonthlyCost, getTranslateDailyCost, getTranslateWeeklyCost, getTranslateMonthlyCost, DAILY_LIMIT, WEEKLY_LIMIT, MONTHLY_LIMIT, TRANSLATE_DAILY_LIMIT, TRANSLATE_WEEKLY_LIMIT, TRANSLATE_MONTHLY_LIMIT } from './usage.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -38,14 +39,26 @@ if (!IS_LOCAL) {
   console.log('[Storage] Using in-memory storage (local mode)');
 }
 
+/**
+ * Generate a signed URL for a GCS file (24h expiry).
+ * Requires the service account to have roles/iam.serviceAccountTokenCreator.
+ */
+async function getSignedMediaUrl(gcsFileName) {
+  const [signedUrl] = await bucket.file(gcsFileName).getSignedUrl({
+    action: 'read',
+    expires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
+  });
+  return signedUrl;
+}
+
 // In-memory session storage for local development
 const localSessions = new Map();
 
 // SSE clients for progress updates
 const progressClients = new Map();
 
-// Analysis sessions (for chunking workflow)
-const analysisSessions = new Map();
+// Analysis sessions (for chunking workflow) — LRU-bounded to prevent memory leaks
+const analysisSessions = new LRUCache({ max: 50 });
 
 // URL to session ID cache (for reusing existing analysis)
 // Maps normalized URL -> { sessionId, timestamp }
@@ -453,7 +466,13 @@ function isAllowedProxyUrl(urlString) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    /^https:\/\/russian-transcription.*\.run\.app$/,
+    'http://localhost:5173',
+    'http://localhost:3001',
+  ],
+}));
 app.use(express.json());
 
 // Health check — before auth so monitoring works without tokens
@@ -548,8 +567,111 @@ async function requireSessionOwnership(req, res, next) {
   next();
 }
 
-// Translation cache (in-memory for simplicity, could use Redis in production)
-const translationCache = new Map();
+/**
+ * GET /api/usage
+ * Returns current user's API usage across all limit periods.
+ */
+app.get('/api/usage', (req, res) => {
+  res.json({
+    openai: {
+      daily: { used: getUserCost(req.uid), limit: DAILY_LIMIT },
+      weekly: { used: getUserWeeklyCost(req.uid), limit: WEEKLY_LIMIT },
+      monthly: { used: getUserMonthlyCost(req.uid), limit: MONTHLY_LIMIT },
+    },
+    translate: {
+      daily: { used: getTranslateDailyCost(req.uid), limit: TRANSLATE_DAILY_LIMIT },
+      weekly: { used: getTranslateWeeklyCost(req.uid), limit: TRANSLATE_WEEKLY_LIMIT },
+      monthly: { used: getTranslateMonthlyCost(req.uid), limit: TRANSLATE_MONTHLY_LIMIT },
+    },
+  });
+});
+
+/**
+ * DELETE /api/account
+ * Permanently delete the user's account and all associated data:
+ * 1. Firestore decks/{uid} and usage/{uid}
+ * 2. GCS sessions owned by the user
+ * 3. In-memory sessions
+ * 4. Firebase Auth user
+ */
+app.delete('/api/account', async (req, res) => {
+  const uid = req.uid;
+  console.log(`[Account] Deleting account for ${uid}`);
+
+  try {
+    // 1. Delete Firestore documents (decks + usage)
+    try {
+      const { getFirestore } = await import('firebase-admin/firestore');
+      const db = getFirestore();
+      await Promise.all([
+        db.collection('decks').doc(uid).delete().catch(() => {}),
+        db.collection('usage').doc(uid).delete().catch(() => {}),
+      ]);
+      console.log(`[Account] Deleted Firestore docs for ${uid}`);
+    } catch (err) {
+      console.log(`[Account] Firestore cleanup skipped:`, err.message);
+    }
+
+    // 2. Delete GCS sessions owned by the user
+    // TODO: Store uid in GCS filename prefix (sessions/{uid}_{sessionId}.json)
+    // so we can list by prefix instead of downloading/parsing all sessions.
+    if (!IS_LOCAL && bucket) {
+      try {
+        const [sessionFiles] = await bucket.getFiles({ prefix: 'sessions/' });
+        for (const file of sessionFiles) {
+          try {
+            const [contents] = await file.download();
+            const session = JSON.parse(contents.toString());
+            if (session.uid === uid) {
+              const sessionId = file.name.replace('sessions/', '').replace('.json', '');
+              // Delete associated videos
+              const [videoFiles] = await bucket.getFiles({ prefix: `videos/${sessionId}_` });
+              for (const vf of videoFiles) {
+                await vf.delete().catch(() => {});
+              }
+              await file.delete().catch(() => {});
+              console.log(`[Account] Deleted GCS session ${sessionId}`);
+            }
+          } catch {
+            // Skip unreadable sessions
+          }
+        }
+      } catch (err) {
+        console.error(`[Account] GCS cleanup error:`, err.message);
+      }
+    }
+
+    // 3. Clean up in-memory sessions
+    for (const [sessionId, session] of analysisSessions) {
+      if (session.uid === uid) {
+        analysisSessions.delete(sessionId);
+      }
+    }
+    // Clean up URL cache entries for this user
+    for (const [key] of urlSessionCache) {
+      if (key.startsWith(`${uid}:`)) {
+        urlSessionCache.delete(key);
+      }
+    }
+
+    // 4. Delete Firebase Auth user
+    try {
+      await adminAuth.deleteUser(uid);
+      console.log(`[Account] Deleted Firebase Auth user ${uid}`);
+    } catch (err) {
+      // May fail in tests or if user already deleted
+      console.log(`[Account] Auth user deletion skipped:`, err.message);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error(`[Account] Error deleting account:`, error);
+    res.status(500).json({ error: error.message || 'Failed to delete account' });
+  }
+});
+
+// Translation cache — LRU-bounded to prevent unbounded growth
+const translationCache = new LRUCache({ max: 10000 });
 
 /**
  * POST /api/translate
@@ -562,6 +684,10 @@ app.post('/api/translate', translateRateLimit, requireTranslateBudget, async (re
 
   if (!word) {
     return res.status(400).json({ error: 'Word is required' });
+  }
+
+  if (word.length > 200) {
+    return res.status(400).json({ error: 'Word is too long (max 200 characters)' });
   }
 
   if (!apiKey) {
@@ -629,6 +755,14 @@ app.post('/api/extract-sentence', extractSentenceRateLimit, requireBudget, async
 
   if (!text || !word) {
     return res.status(400).json({ error: 'text and word are required' });
+  }
+
+  if (word.length > 200) {
+    return res.status(400).json({ error: 'Word is too long (max 200 characters)' });
+  }
+
+  if (text.length > 5000) {
+    return res.status(400).json({ error: 'Text is too long (max 5000 characters)' });
   }
 
   try {
@@ -992,6 +1126,18 @@ app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, asy
 
   if (!url) {
     return res.status(400).json({ error: 'URL is required' });
+  }
+
+  // Only allow ok.ru video URLs and lib.ru text URLs
+  try {
+    const parsedUrl = new URL(url);
+    const isOkRu = parsedUrl.hostname === 'ok.ru' || parsedUrl.hostname.endsWith('.ok.ru');
+    const isLibRu = isLibRuUrl(url);
+    if (!isOkRu && !isLibRu) {
+      return res.status(400).json({ error: 'Only ok.ru and lib.ru URLs are supported' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Invalid URL' });
   }
 
   if (!apiKey) {
@@ -1660,15 +1806,14 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, requireSe
     });
   }
 
-  // If already being downloaded (e.g. by prefetch), wait for it to finish
-  if (chunk.status === 'downloading') {
+  // If already being downloaded (e.g. by prefetch), await its completion promise
+  if (chunk.status === 'downloading' && chunk.downloadPromise) {
     const partNum = parseInt(chunkId.split('-')[1]) + 1;
-    // Poll until the chunk becomes ready (prefetch will finish it)
-    const maxWait = 120000; // 2 minutes
-    const pollInterval = 500;
-    const startWait = Date.now();
-    while (Date.now() - startWait < maxWait) {
-      await new Promise(r => setTimeout(r, pollInterval));
+    try {
+      await Promise.race([
+        chunk.downloadPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 120000)),
+      ]);
       if (chunk.status === 'ready' && (chunk.videoUrl || chunk.audioUrl)) {
         const transcript = session.chunkTranscripts.get(chunkId);
         return res.json({
@@ -1678,14 +1823,9 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, requireSe
           title: `${session.title} - Part ${partNum}`,
         });
       }
-      if (chunk.status === 'pending') {
-        // Prefetch failed, fall through to download below
-        break;
-      }
-    }
-    // If still downloading after timeout, fall through to re-download
-    if (chunk.status === 'downloading') {
-      console.log(`[Download-Chunk] Prefetch timeout for ${chunkId}, re-downloading`);
+    } catch {
+      // Timeout or prefetch failed — fall through to re-download
+      console.log(`[Download-Chunk] Prefetch wait failed for ${chunkId}, re-downloading`);
     }
   }
 
@@ -1728,8 +1868,7 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, requireSe
           destination: gcsFileName,
           metadata: { contentType: 'audio/mpeg', cacheControl: 'public, max-age=86400' },
         });
-        await bucket.file(gcsFileName).makePublic();
-        audioUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+        audioUrl = await getSignedMediaUrl(gcsFileName);
         if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
       } else {
         audioUrl = `/api/local-audio/${sessionId}_${chunkId}.mp3`;
@@ -1821,8 +1960,7 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, requireSe
           cacheControl: 'public, max-age=86400',
         },
       });
-      await bucket.file(gcsFileName).makePublic();
-      videoUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+      videoUrl = await getSignedMediaUrl(gcsFileName);
 
       // Clean up local chunk file
       if (fs.existsSync(chunkPath)) {
@@ -1894,6 +2032,9 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
     const tempDir = path.join(__dirname, 'temp');
     nextChunk.status = 'downloading';
 
+    // Store a promise so download-chunk can await it instead of busy-polling
+    const doWork = async () => {
+
     // ── Text mode prefetch ──
     if (session.contentType === 'text') {
       const audioPath = path.join(tempDir, `tts_${sessionId}_${nextChunk.id}.mp3`);
@@ -1920,8 +2061,7 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
           destination: gcsFileName,
           metadata: { contentType: 'audio/mpeg', cacheControl: 'public, max-age=86400' },
         });
-        await bucket.file(gcsFileName).makePublic();
-        audioUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+        audioUrl = await getSignedMediaUrl(gcsFileName);
         if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
       } else {
         audioUrl = `/api/local-audio/${sessionId}_${nextChunk.id}.mp3`;
@@ -1973,8 +2113,7 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
         destination: gcsFileName,
         metadata: { contentType: 'video/mp4', cacheControl: 'public, max-age=86400' },
       });
-      await bucket.file(gcsFileName).makePublic();
-      videoUrl = `https://storage.googleapis.com/${bucket.name}/${gcsFileName}`;
+      videoUrl = await getSignedMediaUrl(gcsFileName);
       if (fs.existsSync(chunkPath)) fs.unlinkSync(chunkPath);
     } else {
       videoUrl = `/api/local-video/${sessionId}_${nextChunk.id}.mp4`;
@@ -1988,6 +2127,19 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
     await setAnalysisSession(sessionId, session);
 
     console.log(`[Prefetch] Completed ${nextChunk.id} (${(videoSize / 1024 / 1024).toFixed(1)} MB)`);
+
+    }; // end doWork
+
+    // Store promise on chunk so download-chunk handler can await it
+    nextChunk.downloadPromise = doWork().catch(err => {
+      nextChunk.status = 'pending';
+      delete nextChunk.downloadPromise;
+      throw err;
+    }).then(() => {
+      delete nextChunk.downloadPromise;
+    });
+
+    await nextChunk.downloadPromise;
   } catch (err) {
     console.error(`[Prefetch] Error:`, err.message);
     Sentry.captureException(err, { tags: { operation: 'prefetch', sessionId } });

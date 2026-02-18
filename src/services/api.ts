@@ -279,3 +279,32 @@ export async function deleteSession(sessionId: string): Promise<{ success: boole
     method: 'DELETE',
   });
 }
+
+/**
+ * Usage data returned by GET /api/usage
+ */
+export interface UsageBucket {
+  used: number;
+  limit: number;
+}
+
+export interface UsageData {
+  openai: { daily: UsageBucket; weekly: UsageBucket; monthly: UsageBucket };
+  translate: { daily: UsageBucket; weekly: UsageBucket; monthly: UsageBucket };
+}
+
+/**
+ * Get current user's API usage
+ */
+export async function getUsage(): Promise<UsageData> {
+  return apiRequest<UsageData>('/api/usage');
+}
+
+/**
+ * Permanently delete the current user's account
+ */
+export async function deleteAccount(): Promise<{ success: boolean }> {
+  return apiRequest<{ success: boolean }>('/api/account', {
+    method: 'DELETE',
+  });
+}

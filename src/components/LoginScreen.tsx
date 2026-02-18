@@ -1,9 +1,14 @@
+import { useState } from 'react';
+import { TERMS_OF_SERVICE, PRIVACY_POLICY } from '../legal';
+
 interface LoginScreenProps {
   onSignIn: () => void;
   error?: string | null;
 }
 
 export function LoginScreen({ onSignIn, error }: LoginScreenProps) {
+  const [expandedLegal, setExpandedLegal] = useState<'tos' | 'privacy' | null>(null);
+
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
       <div className="max-w-sm w-full bg-white rounded-xl shadow-lg p-8 text-center">
@@ -38,6 +43,36 @@ export function LoginScreen({ onSignIn, error }: LoginScreenProps) {
           </svg>
           Sign in with Google
         </button>
+
+        <p className="mt-4 text-xs text-gray-500" data-testid="legal-agreement">
+          By signing in, you agree to our{' '}
+          <button
+            onClick={() => setExpandedLegal(expandedLegal === 'tos' ? null : 'tos')}
+            className="text-blue-600 hover:text-blue-800 underline"
+            data-testid="login-tos-link"
+          >
+            Terms of Service
+          </button>
+          {' '}and{' '}
+          <button
+            onClick={() => setExpandedLegal(expandedLegal === 'privacy' ? null : 'privacy')}
+            className="text-blue-600 hover:text-blue-800 underline"
+            data-testid="login-privacy-link"
+          >
+            Privacy Policy
+          </button>
+        </p>
+
+        {expandedLegal === 'tos' && (
+          <div className="mt-3 max-h-48 overflow-y-auto text-left text-xs text-gray-500 whitespace-pre-line border rounded-lg p-3" data-testid="login-tos-content">
+            {TERMS_OF_SERVICE}
+          </div>
+        )}
+        {expandedLegal === 'privacy' && (
+          <div className="mt-3 max-h-48 overflow-y-auto text-left text-xs text-gray-500 whitespace-pre-line border rounded-lg p-3" data-testid="login-privacy-content">
+            {PRIVACY_POLICY}
+          </div>
+        )}
 
         {error && (
           <p className="mt-4 text-sm text-red-600">{error}</p>
