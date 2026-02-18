@@ -65,8 +65,9 @@ test.describe('Word popup (regression tests)', () => {
   test('popup is positioned relative to clicked word (scrolls with content)', async ({ page }) => {
     await navigateToPlayer(page);
 
-    // Click a word (use a unique word to avoid popup text collision)
-    await page.locator('text=маленьком').click();
+    // Click a word — use .first() since the word also appears in the popup
+    const wordLocator = page.locator('text=маленьком').first();
+    await wordLocator.click();
     const popup = page.locator('.shadow-lg');
     await expect(popup).toBeVisible({ timeout: 5000 });
 
@@ -77,7 +78,7 @@ test.describe('Word popup (regression tests)', () => {
     // The popup's parent span has position: relative, and the popup uses
     // position: absolute with top: 100%. This means it scrolls with the
     // word. Verify the popup is near the word, not at a fixed screen position.
-    const wordBox = await page.locator('text=маленьком').boundingBox();
+    const wordBox = await wordLocator.boundingBox();
     expect(wordBox).toBeTruthy();
 
     // Popup should be below the word (top of popup >= bottom of word, roughly)
