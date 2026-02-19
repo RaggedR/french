@@ -127,22 +127,15 @@ export async function setupMockRoutes(page: Page, options: {
     });
   });
 
-  // GET /api/usage → mock usage data
+  // GET /api/usage → mock combined API usage data
   await page.route('**/api/usage', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
-        openai: {
-          daily: { used: 0.45, limit: 1.00 },
-          weekly: { used: 1.20, limit: 5.00 },
-          monthly: { used: 3.50, limit: 10.00 },
-        },
-        translate: {
-          daily: { used: 0.10, limit: 0.50 },
-          weekly: { used: 0.40, limit: 2.50 },
-          monthly: { used: 1.00, limit: 5.00 },
-        },
+        daily: { used: 0.55, limit: 1.00 },    // Combined: 0.45 (OpenAI) + 0.10 (Translate)
+        weekly: { used: 1.60, limit: 5.00 },   // Combined: 1.20 + 0.40
+        monthly: { used: 4.50, limit: 10.00 }, // Combined: 3.50 + 1.00
       }),
     });
   });

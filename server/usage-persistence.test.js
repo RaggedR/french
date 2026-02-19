@@ -65,8 +65,8 @@ describe('usage.js — Firestore persistence', () => {
     expect(mockDocs.has(uid)).toBe(true);
 
     const saved = mockDocs.get(uid);
-    expect(saved.openai.daily.cost).toBeCloseTo(0.10);
-    expect(saved.openai.daily.date).toBe('2026-03-15');
+    expect(saved.daily.cost).toBeCloseTo(0.10);
+    expect(saved.daily.date).toBe('2026-03-15');
     expect(saved.updatedAt).toBeDefined();
   });
 
@@ -81,22 +81,37 @@ describe('usage.js — Firestore persistence', () => {
     expect(mockSet).toHaveBeenCalledTimes(1);
 
     const saved = mockDocs.get(uid);
-    expect(saved.openai.daily.cost).toBeCloseTo(0.056);
+    expect(saved.daily.cost).toBeCloseTo(0.056);
   });
 
-  it('trackTranslateCost also triggers persistence', async () => {
+  it('trackTranslateCost (alias) also triggers persistence', async () => {
     trackTranslateCost(uid, 0.05);
 
     await vi.advanceTimersByTimeAsync(5000);
 
     expect(mockSet).toHaveBeenCalledTimes(1);
     const saved = mockDocs.get(uid);
-    expect(saved.translate.daily.cost).toBeCloseTo(0.05);
-    expect(saved.translate.daily.date).toBe('2026-03-15');
+    expect(saved.daily.cost).toBeCloseTo(0.05);
+    expect(saved.daily.date).toBe('2026-03-15');
   });
 
-  it('initUsageStore loads current-period data from Firestore into Maps', async () => {
-    // Pre-populate Firestore mock with data for "today"
+  it('initUsageStore loads current-period data from Firestore (new schema)', async () => {
+    // Pre-populate Firestore mock with flat schema data for "today"
+    mockDocs.set(uid, {
+      daily: { cost: 0.70, date: '2026-03-15' },
+      weekly: { cost: 3.00, week: '2026-W11' },
+      monthly: { cost: 10.00, month: '2026-03' },
+    });
+
+    await initUsageStore();
+
+    expect(getUserCost(uid)).toBeCloseTo(0.70);
+    expect(getUserWeeklyCost(uid)).toBeCloseTo(3.00);
+    expect(getUserMonthlyCost(uid)).toBeCloseTo(10.00);
+  });
+
+  it('initUsageStore migrates legacy schema (openai+translate)', async () => {
+    // Pre-populate with old nested schema
     mockDocs.set(uid, {
       openai: {
         daily: { cost: 0.50, date: '2026-03-15' },
@@ -112,24 +127,18 @@ describe('usage.js — Firestore persistence', () => {
 
     await initUsageStore();
 
-    expect(getUserCost(uid)).toBeCloseTo(0.50);
-    expect(getUserWeeklyCost(uid)).toBeCloseTo(2.00);
-    expect(getUserMonthlyCost(uid)).toBeCloseTo(7.00);
+    // Should merge into combined budget
+    expect(getUserCost(uid)).toBeCloseTo(0.70);        // 0.50 + 0.20
+    expect(getUserWeeklyCost(uid)).toBeCloseTo(3.00);  // 2.00 + 1.00
+    expect(getUserMonthlyCost(uid)).toBeCloseTo(10.00); // 7.00 + 3.00
   });
 
   it('initUsageStore skips expired period data', async () => {
     // Data from yesterday / last week / last month — should NOT load
     mockDocs.set(uid, {
-      openai: {
-        daily: { cost: 0.50, date: '2026-03-14' },         // yesterday
-        weekly: { cost: 2.00, week: '2026-W10' },           // last week
-        monthly: { cost: 7.00, month: '2026-02' },          // last month
-      },
-      translate: {
-        daily: { cost: 0.20, date: '2026-03-14' },
-        weekly: { cost: 1.00, week: '2026-W10' },
-        monthly: { cost: 3.00, month: '2026-02' },
-      },
+      daily: { cost: 0.70, date: '2026-03-14' },         // yesterday
+      weekly: { cost: 3.00, week: '2026-W10' },          // last week
+      monthly: { cost: 10.00, month: '2026-02' },        // last month
     });
 
     await initUsageStore();

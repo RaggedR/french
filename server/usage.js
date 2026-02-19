@@ -5,8 +5,7 @@
  * A write-behind cache persists to Firestore with 5s debounce per user.
  * On startup, initUsageStore() hydrates Maps from Firestore.
  *
- * OpenAI limits:    $1/day, $5/week, $10/month
- * Translate limits: $0.50/day, $2.50/week, $5/month
+ * Combined API limits: $1/day, $5/week, $10/month (OpenAI + Google Translate)
  *
  * Cost estimates:
  *   Whisper:           $0.006 / minute of audio
@@ -14,6 +13,9 @@
  *   GPT-4o-mini:       ~$0.002 per call (sentence extraction)
  *   TTS:               $15 / 1M characters
  *   Google Translate:   $20 / 1M characters
+ *
+ * Test utilities:
+ *   clearAllCostsForTesting() - Clears all cost Maps (test-only, requires VITEST env)
  */
 
 import { getFirestore } from 'firebase-admin/firestore';
@@ -23,19 +25,21 @@ export const DAILY_LIMIT = 1.00;    // $1/day per user
 export const WEEKLY_LIMIT = 5.00;   // $5/week per user
 export const MONTHLY_LIMIT = 10.00; // $10/month per user
 
-export const TRANSLATE_DAILY_LIMIT = 0.50;
-export const TRANSLATE_WEEKLY_LIMIT = 2.50;
-export const TRANSLATE_MONTHLY_LIMIT = 5.00;
-
-// OpenAI: uid -> { cost, date/week/month }
+// Combined API costs: uid -> { cost, date/week/month }
 const dailyCosts = new Map();
 const weeklyCosts = new Map();
 const monthlyCosts = new Map();
 
-// Google Translate: uid -> { cost, date/week/month }
-const translateDailyCosts = new Map();
-const translateWeeklyCosts = new Map();
-const translateMonthlyCosts = new Map();
+// Test-only helper to clear all Maps for test isolation
+export function clearAllCostsForTesting() {
+  if (process.env.VITEST) {
+    dailyCosts.clear();
+    weeklyCosts.clear();
+    monthlyCosts.clear();
+  } else {
+    throw new Error('clearAllCostsForTesting() can only be called during tests');
+  }
+}
 
 // --- Firestore persistence (write-behind cache) ----------------------------
 
@@ -60,16 +64,9 @@ async function writeUsageToFirestore(uid) {
   const firestore = getDb();
   if (!firestore) return;
   await firestore.collection('usage').doc(uid).set({
-    openai: {
-      daily: dailyCosts.get(uid) || null,
-      weekly: weeklyCosts.get(uid) || null,
-      monthly: monthlyCosts.get(uid) || null,
-    },
-    translate: {
-      daily: translateDailyCosts.get(uid) || null,
-      weekly: translateWeeklyCosts.get(uid) || null,
-      monthly: translateMonthlyCosts.get(uid) || null,
-    },
+    daily: dailyCosts.get(uid) || null,
+    weekly: weeklyCosts.get(uid) || null,
+    monthly: monthlyCosts.get(uid) || null,
     updatedAt: new Date().toISOString(),
   });
 }
@@ -100,7 +97,6 @@ export async function flushAllUsage() {
   // Collect all UIDs that have data
   const uids = new Set([
     ...dailyCosts.keys(), ...weeklyCosts.keys(), ...monthlyCosts.keys(),
-    ...translateDailyCosts.keys(), ...translateWeeklyCosts.keys(), ...translateMonthlyCosts.keys(),
   ]);
   if (uids.size === 0) return;
   console.log(`[Usage] Flushing data for ${uids.size} users...`);
@@ -137,12 +133,28 @@ export async function initUsageStore() {
     for (const doc of snapshot.docs) {
       const uid = doc.id;
       const data = doc.data();
-      if (data.openai?.daily?.date === today) dailyCosts.set(uid, data.openai.daily);
-      if (data.openai?.weekly?.week === week) weeklyCosts.set(uid, data.openai.weekly);
-      if (data.openai?.monthly?.month === month) monthlyCosts.set(uid, data.openai.monthly);
-      if (data.translate?.daily?.date === today) translateDailyCosts.set(uid, data.translate.daily);
-      if (data.translate?.weekly?.week === week) translateWeeklyCosts.set(uid, data.translate.weekly);
-      if (data.translate?.monthly?.month === month) translateMonthlyCosts.set(uid, data.translate.monthly);
+      // New schema: flat structure
+      if (data.daily?.date === today) dailyCosts.set(uid, data.daily);
+      if (data.weekly?.week === week) weeklyCosts.set(uid, data.weekly);
+      if (data.monthly?.month === month) monthlyCosts.set(uid, data.monthly);
+      // Legacy schema: migrate openai+translate costs into single budget
+      if (data.openai || data.translate) {
+        const openaiDaily = (data.openai?.daily?.date === today) ? data.openai.daily.cost : 0;
+        const translateDaily = (data.translate?.daily?.date === today) ? data.translate.daily.cost : 0;
+        if (openaiDaily + translateDaily > 0) {
+          dailyCosts.set(uid, { cost: openaiDaily + translateDaily, date: today });
+        }
+        const openaiWeekly = (data.openai?.weekly?.week === week) ? data.openai.weekly.cost : 0;
+        const translateWeekly = (data.translate?.weekly?.week === week) ? data.translate.weekly.cost : 0;
+        if (openaiWeekly + translateWeekly > 0) {
+          weeklyCosts.set(uid, { cost: openaiWeekly + translateWeekly, week });
+        }
+        const openaiMonthly = (data.openai?.monthly?.month === month) ? data.openai.monthly.cost : 0;
+        const translateMonthly = (data.translate?.monthly?.month === month) ? data.translate.monthly.cost : 0;
+        if (openaiMonthly + translateMonthly > 0) {
+          monthlyCosts.set(uid, { cost: openaiMonthly + translateMonthly, month });
+        }
+      }
       loaded++;
     }
     console.log(`[Usage] Loaded cost data for ${loaded} users`);
@@ -228,96 +240,27 @@ export function getRemainingBudget(uid) {
 export function requireBudget(req, res, next) {
   if (getUserMonthlyCost(req.uid) >= MONTHLY_LIMIT) {
     return res.status(429).json({
-      error: 'Monthly OpenAI limit reached ($10/month). Please try again next month.',
+      error: 'Monthly API limit reached ($10/month). Please try again next month.',
     });
   }
   if (getUserWeeklyCost(req.uid) >= WEEKLY_LIMIT) {
     return res.status(429).json({
-      error: 'Weekly OpenAI limit reached ($5/week). Please try again next week.',
+      error: 'Weekly API limit reached ($5/week). Please try again next week.',
     });
   }
   if (getUserCost(req.uid) >= DAILY_LIMIT) {
     return res.status(429).json({
-      error: 'Daily OpenAI limit reached ($1/day). Please try again tomorrow.',
+      error: 'Daily API limit reached ($1/day). Please try again tomorrow.',
     });
   }
   next();
 }
 
-// --- Google Translate -------------------------------------------------------
+// --- Backwards compatibility alias -----------------------------------------
 
-export function getTranslateDailyCost(uid) {
-  const entry = translateDailyCosts.get(uid);
-  if (!entry || entry.date !== getToday()) return 0;
-  return entry.cost;
-}
-
-export function getTranslateWeeklyCost(uid) {
-  const entry = translateWeeklyCosts.get(uid);
-  if (!entry || entry.week !== getWeek()) return 0;
-  return entry.cost;
-}
-
-export function getTranslateMonthlyCost(uid) {
-  const entry = translateMonthlyCosts.get(uid);
-  if (!entry || entry.month !== getMonth()) return 0;
-  return entry.cost;
-}
-
+/** Alias for trackCost — Google Translate now shares the unified API budget. */
 export function trackTranslateCost(uid, amount) {
-  const today = getToday();
-  const daily = translateDailyCosts.get(uid);
-  if (!daily || daily.date !== today) {
-    translateDailyCosts.set(uid, { cost: amount, date: today });
-  } else {
-    daily.cost += amount;
-  }
-
-  const week = getWeek();
-  const weekly = translateWeeklyCosts.get(uid);
-  if (!weekly || weekly.week !== week) {
-    translateWeeklyCosts.set(uid, { cost: amount, week });
-  } else {
-    weekly.cost += amount;
-  }
-
-  const month = getMonth();
-  const monthly = translateMonthlyCosts.get(uid);
-  if (!monthly || monthly.month !== month) {
-    translateMonthlyCosts.set(uid, { cost: amount, month });
-  } else {
-    monthly.cost += amount;
-  }
-
-  persistUsage(uid);
-}
-
-export function requireTranslateBudget(req, res, next) {
-  const monthEntry = translateMonthlyCosts.get(req.uid);
-  const monthlyCost = (monthEntry && monthEntry.month === getMonth()) ? monthEntry.cost : 0;
-  if (monthlyCost >= TRANSLATE_MONTHLY_LIMIT) {
-    return res.status(429).json({
-      error: 'Monthly translation limit reached ($5/month). Please try again next month.',
-    });
-  }
-
-  const weekEntry = translateWeeklyCosts.get(req.uid);
-  const weeklyCost = (weekEntry && weekEntry.week === getWeek()) ? weekEntry.cost : 0;
-  if (weeklyCost >= TRANSLATE_WEEKLY_LIMIT) {
-    return res.status(429).json({
-      error: 'Weekly translation limit reached ($2.50/week). Please try again next week.',
-    });
-  }
-
-  const dayEntry = translateDailyCosts.get(req.uid);
-  const dailyCost = (dayEntry && dayEntry.date === getToday()) ? dayEntry.cost : 0;
-  if (dailyCost >= TRANSLATE_DAILY_LIMIT) {
-    return res.status(429).json({
-      error: 'Daily translation limit reached ($0.50/day). Please try again tomorrow.',
-    });
-  }
-
-  next();
+  trackCost(uid, amount);
 }
 
 // --- Cost estimation helpers ------------------------------------------------

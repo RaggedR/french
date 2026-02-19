@@ -118,17 +118,18 @@ test.describe('Usage display', () => {
     await setupMockRoutes(page, { chunks: MOCK_SINGLE_CHUNK, cached: true });
   });
 
-  test('shows usage bars with values from API', async ({ page }) => {
+  test('shows combined API usage bars with values from API', async ({ page }) => {
     await page.goto('/');
     await page.locator('button[title="Settings"]').click();
     await expect(page.locator('text=Settings').first()).toBeVisible({ timeout: 3000 });
 
-    // Usage section should appear with values from mock API
+    // Usage section should appear with combined values from mock API
     await expect(page.locator('text=API Usage')).toBeVisible();
+    await expect(page.locator('text=OpenAI + Google Translate (merged into single budget)')).toBeVisible();
 
-    // Check that usage values are rendered (from mock /api/usage response)
-    await expect(page.locator('text=$0.45 / $1.00')).toBeVisible();
-    await expect(page.locator('text=$3.50 / $10.00')).toBeVisible();
+    // Check that combined usage values are rendered (from mock /api/usage response)
+    await expect(page.locator('text=$0.55 / $1.00')).toBeVisible();   // Daily: 0.45 + 0.10
+    await expect(page.locator('text=$4.50 / $10.00')).toBeVisible();  // Monthly: 3.50 + 1.00
   });
 });
 

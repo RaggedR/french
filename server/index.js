@@ -25,7 +25,7 @@ import {
 import { progressClients, sendProgress, createProgressCallback, friendlyErrorMessage } from './progress.js';
 import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps, BROWSER_UA } from './media.js';
 import { requireAuth, adminAuth } from './auth.js';
-import { trackCost, requireBudget, costs, trackTranslateCost, requireTranslateBudget, initUsageStore, flushAllUsage, getUserCost, getUserWeeklyCost, getUserMonthlyCost, getTranslateDailyCost, getTranslateWeeklyCost, getTranslateMonthlyCost, DAILY_LIMIT, WEEKLY_LIMIT, MONTHLY_LIMIT, TRANSLATE_DAILY_LIMIT, TRANSLATE_WEEKLY_LIMIT, TRANSLATE_MONTHLY_LIMIT } from './usage.js';
+import { trackCost, requireBudget, costs, trackTranslateCost, initUsageStore, flushAllUsage, getUserCost, getUserWeeklyCost, getUserMonthlyCost, DAILY_LIMIT, WEEKLY_LIMIT, MONTHLY_LIMIT } from './usage.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -100,9 +100,44 @@ function isAllowedProxyUrl(urlString) {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// helmet disabled — multiple headers (COOP, CORP, CSP) break Firebase Google Sign-In
-// TODO: re-enable with a carefully tested config
-// app.use(helmet({ ... }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    reportOnly: true,  // Phase 1: log violations, don't block
+    directives: {
+      'default-src': ["'self'"],
+      'script-src': ["'self'", "https://www.youtube.com"],
+      'style-src': ["'self'", "https://fonts.googleapis.com", "'unsafe-inline'"],
+      'font-src': ["'self'", "https://fonts.gstatic.com"],
+      'img-src': ["'self'", "https://lh3.googleusercontent.com", "https://www.google.com"],
+      'connect-src': [
+        "'self'",
+        "https://firestore.googleapis.com",
+        "https://securetoken.googleapis.com",
+        "https://identitytoolkit.googleapis.com",
+        "https://*.sentry.io",
+      ],
+      'media-src': [
+        "'self'",
+        "https://storage.googleapis.com",
+        "https://*.mycdn.me",
+        "https://*.userapi.com",
+        "https://*.okcdn.ru",
+        "https://ok.ru",
+        "blob:",
+      ],
+      'frame-src': ["'self'", "https://www.youtube.com", "https://accounts.google.com"],
+      'object-src': ["'none'"],
+      'base-uri': ["'self'"],
+      'form-action': ["'self'", "https://accounts.google.com"],
+    },
+  },
+  crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false,
+  frameguard: { action: 'deny' },
+  strictTransportSecurity: { maxAge: 63072000, includeSubDomains: true, preload: true },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+}));
 app.use(cors({
   origin: [
     /^https:\/\/russian-transcription.*\.run\.app$/,
@@ -111,6 +146,40 @@ app.use(cors({
   ],
 }));
 app.use(express.json());
+
+// Reverse proxy for Firebase reserved URLs (/__/auth/*, /__/firebase/*) —
+// enables same-origin popup auth to avoid Chrome's third-party cookie blocking.
+// In production, authDomain points to this Cloud Run service instead of
+// firebaseapp.com, so the popup opens on the same origin.
+const FIREBASE_AUTH_DOMAIN = 'russian-transcription.firebaseapp.com';
+app.use('/__', async (req, res) => {
+  const target = `https://${FIREBASE_AUTH_DOMAIN}/__${req.url}`;
+  try {
+    const upstream = await fetch(target, {
+      method: req.method,
+      headers: { 'Accept': req.headers.accept || '*/*' },
+      redirect: 'manual',
+    });
+
+    res.status(upstream.status);
+
+    for (const header of ['content-type', 'cache-control', 'location']) {
+      const val = upstream.headers.get(header);
+      if (val) res.setHeader(header, val);
+    }
+    const cookies = upstream.headers.getSetCookie?.() || [];
+    cookies.forEach(c => res.append('Set-Cookie', c));
+
+    // Strip CSP headers — Firebase auth pages have their own JS that our CSP would break
+    res.removeHeader('content-security-policy');
+    res.removeHeader('content-security-policy-report-only');
+
+    res.send(Buffer.from(await upstream.arrayBuffer()));
+  } catch (err) {
+    console.error('[Auth proxy] Error proxying to Firebase:', err.message);
+    res.status(502).send('Auth proxy error');
+  }
+});
 
 // Health check — before auth so monitoring works without tokens
 app.get('/api/health', async (req, res) => {
@@ -245,20 +314,13 @@ async function requireSessionOwnership(req, res, next) {
 
 /**
  * GET /api/usage
- * Returns current user's API usage across all limit periods.
+ * Returns current user's combined API usage (OpenAI + Google Translate) across all limit periods.
  */
 app.get('/api/usage', (req, res) => {
   res.json({
-    openai: {
-      daily: { used: getUserCost(req.uid), limit: DAILY_LIMIT },
-      weekly: { used: getUserWeeklyCost(req.uid), limit: WEEKLY_LIMIT },
-      monthly: { used: getUserMonthlyCost(req.uid), limit: MONTHLY_LIMIT },
-    },
-    translate: {
-      daily: { used: getTranslateDailyCost(req.uid), limit: TRANSLATE_DAILY_LIMIT },
-      weekly: { used: getTranslateWeeklyCost(req.uid), limit: TRANSLATE_WEEKLY_LIMIT },
-      monthly: { used: getTranslateMonthlyCost(req.uid), limit: TRANSLATE_MONTHLY_LIMIT },
-    },
+    daily: { used: getUserCost(req.uid), limit: DAILY_LIMIT },
+    weekly: { used: getUserWeeklyCost(req.uid), limit: WEEKLY_LIMIT },
+    monthly: { used: getUserMonthlyCost(req.uid), limit: MONTHLY_LIMIT },
   });
 });
 
@@ -478,7 +540,7 @@ app.delete('/api/account', async (req, res) => {
  * Accepts: { word: string }
  * Returns: { word: string, translation: string, sourceLanguage: string }
  */
-app.post('/api/translate', translateRateLimit, requireTranslateBudget, async (req, res) => {
+app.post('/api/translate', translateRateLimit, requireBudget, async (req, res) => {
   const { word } = req.body;
   const apiKey = process.env.GOOGLE_TRANSLATE_API_KEY;
 
