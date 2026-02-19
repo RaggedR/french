@@ -34,24 +34,17 @@ vi.mock('./auth.js', () => ({
 
 vi.mock('./usage.js', () => ({
   requireBudget: (req, res, next) => next(),
-  requireTranslateBudget: (req, res, next) => next(),
   trackCost: () => {},
   trackTranslateCost: () => {},
-  getUserCost: () => 0.45,
-  getUserWeeklyCost: () => 1.20,
-  getUserMonthlyCost: () => 3.50,
-  getTranslateDailyCost: () => 0.10,
-  getTranslateWeeklyCost: () => 0.40,
-  getTranslateMonthlyCost: () => 1.00,
+  getUserCost: () => 0.55,          // Combined: 0.45 (OpenAI) + 0.10 (Translate)
+  getUserWeeklyCost: () => 1.60,     // Combined: 1.20 + 0.40
+  getUserMonthlyCost: () => 4.50,    // Combined: 3.50 + 1.00
   getRemainingBudget: () => 1,
   initUsageStore: vi.fn().mockResolvedValue(undefined),
   flushAllUsage: vi.fn().mockResolvedValue(undefined),
   DAILY_LIMIT: 1.00,
   WEEKLY_LIMIT: 5.00,
   MONTHLY_LIMIT: 10.00,
-  TRANSLATE_DAILY_LIMIT: 0.50,
-  TRANSLATE_WEEKLY_LIMIT: 2.50,
-  TRANSLATE_MONTHLY_LIMIT: 5.00,
   costs: {
     whisper: () => 0,
     gpt4o: () => 0,
@@ -359,12 +352,19 @@ describe('A. Health Check', () => {
     expect(body).toHaveProperty('gcs');
   });
 
-  // helmet disabled — breaks Firebase Google Sign-In (see PR #23)
-  // Re-enable this test when helmet is re-added with a working config
-  it.skip('GET /api/health includes security headers from helmet', async () => {
+  it('GET /api/health includes security headers from helmet', async () => {
     const res = await fetch(`${baseUrl}/api/health`);
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
-    expect(res.headers.get('x-frame-options')).toBeTruthy();
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('strict-transport-security')).toBeTruthy();
+    expect(res.headers.get('content-security-policy-report-only')).toBeTruthy();
+    expect(res.headers.get('cross-origin-opener-policy')).toBe('same-origin-allow-popups');
+  });
+
+  it('GET /__/firebase/init.json does NOT include CSP headers', async () => {
+    const res = await fetch(`${baseUrl}/__/firebase/init.json`);
+    expect(res.headers.get('content-security-policy')).toBeNull();
+    expect(res.headers.get('content-security-policy-report-only')).toBeNull();
   });
 });
 
@@ -1476,22 +1476,15 @@ describe('P. Concurrency Limit on /api/analyze', () => {
 // ---------------------------------------------------------------------------
 
 describe('Q. GET /api/usage', () => {
-  it('returns usage data with correct shape', async () => {
+  it('returns combined API usage data with correct shape', async () => {
     const res = await fetch(`${baseUrl}/api/usage`);
     expect(res.status).toBe(200);
     const body = await res.json();
 
-    // OpenAI buckets
-    expect(body.openai).toBeDefined();
-    expect(body.openai.daily).toEqual({ used: 0.45, limit: 1.00 });
-    expect(body.openai.weekly).toEqual({ used: 1.20, limit: 5.00 });
-    expect(body.openai.monthly).toEqual({ used: 3.50, limit: 10.00 });
-
-    // Translate buckets
-    expect(body.translate).toBeDefined();
-    expect(body.translate.daily).toEqual({ used: 0.10, limit: 0.50 });
-    expect(body.translate.weekly).toEqual({ used: 0.40, limit: 2.50 });
-    expect(body.translate.monthly).toEqual({ used: 1.00, limit: 5.00 });
+    // Combined API buckets (OpenAI + Translate)
+    expect(body.daily).toEqual({ used: 0.55, limit: 1.00 });
+    expect(body.weekly).toEqual({ used: 1.60, limit: 5.00 });
+    expect(body.monthly).toEqual({ used: 4.50, limit: 10.00 });
   });
 });
 

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { onAuthStateChanged, signInWithPopup, getRedirectResult, signOut as firebaseSignOut, GoogleAuthProvider } from 'firebase/auth';
+import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut, GoogleAuthProvider } from 'firebase/auth';
 import { auth } from '../firebase';
 
 export interface AuthUser {
@@ -26,11 +26,6 @@ function useAuthReal(): AuthState {
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Check for redirect result on page load
-    getRedirectResult(auth).catch((err) => {
-      setAuthError(`Redirect: ${err.code} — ${err.message}`);
-    });
-
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
       if (firebaseUser) {
         setUserId(firebaseUser.uid);

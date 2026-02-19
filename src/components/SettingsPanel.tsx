@@ -168,19 +168,15 @@ export function SettingsPanel({
         {/* Usage */}
         {userId && (
           <div className="mb-6 border-t pt-6">
-            <h3 className="text-sm font-medium text-gray-700 mb-3">API Usage</h3>
+            <h3 className="text-sm font-medium text-gray-700 mb-3">🔥 COMBINED API Usage 🔥</h3>
+            <p className="text-xs text-gray-500 mb-2">OpenAI + Google Translate (merged into single budget)</p>
             {usageLoading ? (
               <p className="text-xs text-gray-400">Loading...</p>
             ) : usage ? (
               <div>
-                <p className="text-xs text-gray-500 mb-2 font-medium">OpenAI</p>
-                <UsageBar label="Today" used={usage.openai.daily.used} limit={usage.openai.daily.limit} />
-                <UsageBar label="This week" used={usage.openai.weekly.used} limit={usage.openai.weekly.limit} />
-                <UsageBar label="This month" used={usage.openai.monthly.used} limit={usage.openai.monthly.limit} />
-                <p className="text-xs text-gray-500 mb-2 mt-3 font-medium">Translation</p>
-                <UsageBar label="Today" used={usage.translate.daily.used} limit={usage.translate.daily.limit} />
-                <UsageBar label="This week" used={usage.translate.weekly.used} limit={usage.translate.weekly.limit} />
-                <UsageBar label="This month" used={usage.translate.monthly.used} limit={usage.translate.monthly.limit} />
+                <UsageBar label="Today" used={usage.daily.used} limit={usage.daily.limit} />
+                <UsageBar label="This week" used={usage.weekly.used} limit={usage.weekly.limit} />
+                <UsageBar label="This month" used={usage.monthly.used} limit={usage.monthly.limit} />
               </div>
             ) : (
               <p className="text-xs text-gray-400">Could not load usage data</p>

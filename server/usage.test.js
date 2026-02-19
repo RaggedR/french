@@ -12,17 +12,11 @@ import {
   getRemainingBudget,
   requireBudget,
   trackTranslateCost,
-  requireTranslateBudget,
-  getTranslateDailyCost,
-  getTranslateWeeklyCost,
-  getTranslateMonthlyCost,
   flushAllUsage,
+  clearAllCostsForTesting,
   DAILY_LIMIT,
   WEEKLY_LIMIT,
   MONTHLY_LIMIT,
-  TRANSLATE_DAILY_LIMIT,
-  TRANSLATE_WEEKLY_LIMIT,
-  TRANSLATE_MONTHLY_LIMIT,
   costs,
 } from './usage.js';
 
@@ -60,6 +54,7 @@ describe('usage.js', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    clearAllCostsForTesting();
   });
 
   // --- Cost estimation helpers -----------------------------------------------
@@ -89,7 +84,7 @@ describe('usage.js', () => {
     });
   });
 
-  // --- OpenAI cost tracking --------------------------------------------------
+  // --- Combined API cost tracking (OpenAI + Translate) -----------------------
 
   describe('trackCost / getUserCost', () => {
     it('tracks daily cost for a user', () => {
@@ -274,148 +269,38 @@ describe('usage.js', () => {
     });
   });
 
-  // --- Google Translate cost tracking ----------------------------------------
+  // --- trackTranslateCost (backwards compatibility alias) --------------------
 
-  describe('trackTranslateCost / requireTranslateBudget', () => {
-    it('allows translate under daily limit', () => {
-      const { req, res, next, wasNextCalled } = mockReqResNext(uid);
-      requireTranslateBudget(req, res, next);
-      expect(wasNextCalled()).toBe(true);
-    });
-
-    it('blocks translate at daily limit ($0.50)', () => {
-      trackTranslateCost(uid, 0.50);
-      const { req, res, next, wasNextCalled } = mockReqResNext(uid);
-      requireTranslateBudget(req, res, next);
-      expect(wasNextCalled()).toBe(false);
-      expect(res.statusCode).toBe(429);
-      expect(res.body.error).toContain('Daily translation');
-    });
-
-    it('blocks translate at weekly limit ($2.50)', () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date('2026-03-09T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-10T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-11T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-12T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-13T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-14T10:00:00Z'));
+  describe('trackTranslateCost', () => {
+    it('is an alias for trackCost (merged budget)', () => {
       trackTranslateCost(uid, 0.10);
-      // Weekly: $2.55, daily today: $0.10
-
-      const { req, res, next, wasNextCalled } = mockReqResNext(uid);
-      requireTranslateBudget(req, res, next);
-      expect(wasNextCalled()).toBe(false);
-      expect(res.statusCode).toBe(429);
-      expect(res.body.error).toContain('Weekly translation');
+      expect(getUserCost(uid)).toBeCloseTo(0.10);
     });
 
-    it('blocks translate at monthly limit ($5)', () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date('2026-03-02T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-03T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-04T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-05T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-06T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      // Week 10: $2.45
+    it('translation costs count toward combined API budget', () => {
+      trackCost(uid, 0.40);         // OpenAI
+      trackTranslateCost(uid, 0.15); // Translate
+      expect(getUserCost(uid)).toBeCloseTo(0.55);
+    });
 
-      vi.setSystemTime(new Date('2026-03-09T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-10T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-11T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-12T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      vi.setSystemTime(new Date('2026-03-13T10:00:00Z'));
-      trackTranslateCost(uid, 0.49);
-      // Week 11: $2.45, monthly: $4.90
-
-      vi.setSystemTime(new Date('2026-03-16T10:00:00Z'));
-      trackTranslateCost(uid, 0.15);
-      // Week 12: $0.15, monthly: $5.05
-
+    it('combined costs are checked by requireBudget', () => {
+      trackCost(uid, 0.60);
+      trackTranslateCost(uid, 0.45);
+      // Total: $1.05, exceeds daily limit
       const { req, res, next, wasNextCalled } = mockReqResNext(uid);
-      requireTranslateBudget(req, res, next);
+      requireBudget(req, res, next);
       expect(wasNextCalled()).toBe(false);
       expect(res.statusCode).toBe(429);
-      expect(res.body.error).toContain('Monthly translation');
     });
   });
 
   // --- Limit constants --------------------------------------------------------
 
   describe('exported limit constants', () => {
-    it('exports OpenAI limits', () => {
+    it('exports combined API limits', () => {
       expect(DAILY_LIMIT).toBe(1.00);
       expect(WEEKLY_LIMIT).toBe(5.00);
       expect(MONTHLY_LIMIT).toBe(10.00);
-    });
-
-    it('exports Translate limits', () => {
-      expect(TRANSLATE_DAILY_LIMIT).toBe(0.50);
-      expect(TRANSLATE_WEEKLY_LIMIT).toBe(2.50);
-      expect(TRANSLATE_MONTHLY_LIMIT).toBe(5.00);
-    });
-  });
-
-  // --- Translate getter functions --------------------------------------------
-
-  describe('getTranslateDailyCost / getTranslateWeeklyCost / getTranslateMonthlyCost', () => {
-    it('returns 0 for unknown user', () => {
-      expect(getTranslateDailyCost('nonexistent')).toBe(0);
-      expect(getTranslateWeeklyCost('nonexistent')).toBe(0);
-      expect(getTranslateMonthlyCost('nonexistent')).toBe(0);
-    });
-
-    it('tracks and retrieves translate costs across all periods', () => {
-      trackTranslateCost(uid, 0.05);
-      trackTranslateCost(uid, 0.03);
-      expect(getTranslateDailyCost(uid)).toBeCloseTo(0.08, 5);
-      expect(getTranslateWeeklyCost(uid)).toBeCloseTo(0.08, 5);
-      expect(getTranslateMonthlyCost(uid)).toBeCloseTo(0.08, 5);
-    });
-
-    it('resets daily translate cost on new day but keeps weekly/monthly', () => {
-      vi.useFakeTimers();
-      // Use Monday → Tuesday (same ISO week, same month)
-      vi.setSystemTime(new Date('2026-03-16T10:00:00Z')); // Monday
-      trackTranslateCost(uid, 0.20);
-      expect(getTranslateDailyCost(uid)).toBeCloseTo(0.20);
-
-      // Advance to next day (Tuesday — still same ISO week and month)
-      vi.setSystemTime(new Date('2026-03-17T10:00:00Z'));
-      expect(getTranslateDailyCost(uid)).toBe(0);
-      expect(getTranslateWeeklyCost(uid)).toBeCloseTo(0.20);
-      expect(getTranslateMonthlyCost(uid)).toBeCloseTo(0.20);
-    });
-  });
-
-  // --- Isolation between OpenAI and Translate --------------------------------
-
-  describe('OpenAI and Translate tracking are independent', () => {
-    it('OpenAI costs do not affect translate budget', () => {
-      trackCost(uid, 1.00); // Hit OpenAI daily limit
-      const { req, res, next, wasNextCalled } = mockReqResNext(uid);
-      requireTranslateBudget(req, res, next);
-      expect(wasNextCalled()).toBe(true); // Translate should still work
-    });
-
-    it('Translate costs do not affect OpenAI budget', () => {
-      trackTranslateCost(uid, 0.50); // Hit translate daily limit
-      const { req, res, next, wasNextCalled } = mockReqResNext(uid);
-      requireBudget(req, res, next);
-      expect(wasNextCalled()).toBe(true); // OpenAI should still work
     });
   });
 

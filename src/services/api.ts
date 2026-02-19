@@ -302,6 +302,7 @@ export async function deleteSession(sessionId: string): Promise<{ success: boole
 
 /**
  * Usage data returned by GET /api/usage
+ * Combined API usage (OpenAI + Google Translate)
  */
 export interface UsageBucket {
   used: number;
@@ -309,8 +310,9 @@ export interface UsageBucket {
 }
 
 export interface UsageData {
-  openai: { daily: UsageBucket; weekly: UsageBucket; monthly: UsageBucket };
-  translate: { daily: UsageBucket; weekly: UsageBucket; monthly: UsageBucket };
+  daily: UsageBucket;
+  weekly: UsageBucket;
+  monthly: UsageBucket;
 }
 
 /**

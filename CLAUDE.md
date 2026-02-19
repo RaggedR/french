@@ -148,7 +148,7 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 - Costs tracked in-memory with Firestore write-behind persistence (5s debounce per user). `flushAllUsage()` writes all pending data on graceful shutdown (SIGTERM/SIGINT). `initUsageStore()` hydrates from Firestore on startup. See `server/usage.js` for per-call estimates.
 
 **Security & Production Hardening:**
-- `helmet()` middleware adds security headers (CSP, X-Frame-Options, HSTS, X-Content-Type-Options)
+- `helmet()` middleware: CSP report-only mode (logs violations, doesn't block), COOP `same-origin-allow-popups` (Firebase popup auth), CORP `cross-origin`, COEP disabled, HSTS preload, X-Frame-Options DENY. CSP headers stripped from `/__` Firebase auth proxy responses.
 - `/api/health` checks Firestore + GCS connectivity in production (returns 503 `degraded` if either fails)
 - Graceful shutdown on SIGTERM/SIGINT: flushes usage data to Firestore, drains connections, force-exits after 10s
 - SSE inactivity timeout (60s) on the frontend: if no events received, `EventSource` closes and falls back to polling
@@ -281,13 +281,13 @@ GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`
 
 ### In Progress
 - **Google Sign-In broken on production** — debugging. Use `./quick-deploy.sh` to push directly to main while iterating on this fix. Auth errors now displayed on login screen.
-- **Helmet.js disabled** — multiple headers (COOP, CORP, CSP) break Firebase `signInWithPopup`. Reverted in PR #23. Needs to be re-implemented with a carefully tested config that works with Firebase Auth + Google Sign-In + cross-origin CDN resources.
+- **Helmet.js re-enabled (report-only CSP)** — helmet active with COOP `same-origin-allow-popups`, CORP `cross-origin`, CSP in report-only mode. CSP stripped from `/__` Firebase auth proxy responses. After verifying no violations in production, switch CSP to enforcing mode.
 
 ### Payment (Priority: HIGH — Next)
 - Add Stripe subscription: $10/month, first month free
 - Enforce usage quotas per tier (free trial vs paid)
 
 ### Future
-- Re-enable helmet.js with Firebase-compatible config
+- Switch CSP from report-only to enforcing mode (after production verification)
 - Import deck functionality (export already implemented)
 - Android app (React Native or PWA wrapper)
