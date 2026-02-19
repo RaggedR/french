@@ -168,7 +168,7 @@ export function SettingsPanel({
         {/* Usage */}
         {userId && (
           <div className="mb-6 border-t pt-6">
-            <h3 className="text-sm font-medium text-gray-700 mb-3">🔥 COMBINED API Usage 🔥</h3>
+            <h3 className="text-sm font-medium text-gray-700 mb-3">API Usage</h3>
             <p className="text-xs text-gray-500 mb-2">OpenAI + Google Translate (merged into single budget)</p>
             {usageLoading ? (
               <p className="text-xs text-gray-400">Loading...</p>

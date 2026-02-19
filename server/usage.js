@@ -13,6 +13,9 @@
  *   GPT-4o-mini:       ~$0.002 per call (sentence extraction)
  *   TTS:               $15 / 1M characters
  *   Google Translate:   $20 / 1M characters
+ *
+ * Test utilities:
+ *   clearAllCostsForTesting() - Clears all cost Maps (test-only, requires VITEST env)
  */
 
 import { getFirestore } from 'firebase-admin/firestore';
