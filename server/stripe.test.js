@@ -394,12 +394,14 @@ describe('stripe.js', () => {
   // --- createCheckoutSession -------------------------------------------------
 
   describe('createCheckoutSession', () => {
-    it('creates a Stripe checkout session with correct params', async () => {
+    it('creates a Stripe checkout session with customer_email for new user', async () => {
+      // New user — no stripeCustomerId
+      mockFirestoreDoc.get.mockResolvedValue(notFoundDoc());
       mockStripeCheckoutCreate.mockResolvedValue({
         url: 'https://checkout.stripe.com/session/cs_test_123',
       });
 
-      const result = await createCheckoutSession('user-1', 'user@example.com');
+      const result = await createCheckoutSession('user-1', 'user@example.com', 'https://app.example.com');
 
       expect(result.url).toBe('https://checkout.stripe.com/session/cs_test_123');
       expect(mockStripeCheckoutCreate).toHaveBeenCalledTimes(1);
@@ -408,23 +410,50 @@ describe('stripe.js', () => {
       expect(args.mode).toBe('subscription');
       expect(args.client_reference_id).toBe('user-1');
       expect(args.customer_email).toBe('user@example.com');
+      expect(args.customer).toBeUndefined();
       expect(args.subscription_data.metadata.firebaseUid).toBe('user-1');
+      expect(args.success_url).toContain('https://app.example.com');
+    });
+
+    it('reuses existing Stripe customer on resubscribe', async () => {
+      // Existing user with stripeCustomerId (e.g., canceled and resubscribing)
+      mockFirestoreDoc.get.mockResolvedValue(createFirestoreDoc({
+        status: 'canceled',
+        trialStart: new Date().toISOString(),
+        trialEnd: new Date().toISOString(),
+        stripeCustomerId: 'cus_existing_123',
+        stripeSubscriptionId: 'sub_old_456',
+        currentPeriodEnd: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }));
+      mockStripeCheckoutCreate.mockResolvedValue({
+        url: 'https://checkout.stripe.com/session/cs_test_reuse',
+      });
+
+      const result = await createCheckoutSession('user-resub', 'user@example.com', 'https://app.example.com');
+
+      expect(result.url).toBe('https://checkout.stripe.com/session/cs_test_reuse');
+      const args = mockStripeCheckoutCreate.mock.calls[0][0];
+      expect(args.customer).toBe('cus_existing_123');
+      expect(args.customer_email).toBeUndefined();
     });
   });
 
   // --- createPortalSession ---------------------------------------------------
 
   describe('createPortalSession', () => {
-    it('creates a Stripe portal session', async () => {
+    it('creates a Stripe portal session with correct return URL', async () => {
       mockStripeBillingPortalCreate.mockResolvedValue({
         url: 'https://billing.stripe.com/session/bps_test_456',
       });
 
-      const result = await createPortalSession('cus_123');
+      const result = await createPortalSession('cus_123', 'https://app.example.com');
 
       expect(result.url).toBe('https://billing.stripe.com/session/bps_test_456');
       expect(mockStripeBillingPortalCreate).toHaveBeenCalledTimes(1);
-      expect(mockStripeBillingPortalCreate.mock.calls[0][0].customer).toBe('cus_123');
+      const args = mockStripeBillingPortalCreate.mock.calls[0][0];
+      expect(args.customer).toBe('cus_123');
+      expect(args.return_url).toBe('https://app.example.com');
     });
   });
 

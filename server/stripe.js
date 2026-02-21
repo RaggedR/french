@@ -97,13 +97,11 @@ export async function getSubscriptionStatus(uid) {
 
   const firestore = getDb();
   let data;
-  let firestoreAvailable = false;
 
   if (firestore) {
     try {
       const docRef = firestore.collection('subscriptions').doc(uid);
       const doc = await docRef.get();
-      firestoreAvailable = true;
 
       if (!doc.exists) {
         // Lazy-create trial
@@ -208,19 +206,25 @@ export async function requireSubscription(req, res, next) {
 // createCheckoutSession — redirect user to Stripe Checkout
 // ---------------------------------------------------------------------------
 
-export async function createCheckoutSession(uid, email) {
+export async function createCheckoutSession(uid, email, requestOrigin) {
   const s = getStripe();
   if (!s) throw new Error('Stripe not configured');
   if (!process.env.STRIPE_PRICE_ID) throw new Error('STRIPE_PRICE_ID not configured');
 
-  const baseUrl = process.env.APP_URL || 'http://localhost:5173';
+  const baseUrl = requestOrigin || process.env.APP_URL || 'http://localhost:5173';
+
+  // Reuse existing Stripe customer to avoid duplicates on resubscribe
+  const subStatus = await getSubscriptionStatus(uid);
+  const customerParam = subStatus.stripeCustomerId
+    ? { customer: subStatus.stripeCustomerId }
+    : { customer_email: email };
 
   const session = await s.checkout.sessions.create({
     mode: 'subscription',
     payment_method_types: ['card'],
     line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
     client_reference_id: uid,
-    customer_email: email,
+    ...customerParam,
     subscription_data: {
       metadata: { firebaseUid: uid },
     },
@@ -235,11 +239,11 @@ export async function createCheckoutSession(uid, email) {
 // createPortalSession — redirect user to Stripe Customer Portal
 // ---------------------------------------------------------------------------
 
-export async function createPortalSession(stripeCustomerId) {
+export async function createPortalSession(stripeCustomerId, requestOrigin) {
   const s = getStripe();
   if (!s) throw new Error('Stripe not configured');
 
-  const baseUrl = process.env.APP_URL || 'http://localhost:5173';
+  const baseUrl = requestOrigin || process.env.APP_URL || 'http://localhost:5173';
 
   const session = await s.billingPortal.sessions.create({
     customer: stripeCustomerId,

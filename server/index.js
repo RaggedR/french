@@ -160,7 +160,7 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
     res.json({ received: true });
   } catch (err) {
     console.error('[Stripe] Webhook error:', err.message);
-    res.status(400).json({ error: `Webhook error: ${err.message}` });
+    res.status(400).json({ error: 'Webhook signature verification failed' });
   }
 });
 
@@ -444,7 +444,8 @@ app.get('/api/subscription', async (req, res) => {
  */
 app.post('/api/create-checkout-session', async (req, res) => {
   try {
-    const { url } = await createCheckoutSession(req.uid, req.userEmail);
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const { url } = await createCheckoutSession(req.uid, req.userEmail, origin);
     res.json({ url });
   } catch (err) {
     console.error('[Stripe] Checkout session error:', err.message);
@@ -463,7 +464,8 @@ app.post('/api/create-portal-session', async (req, res) => {
     if (!status.stripeCustomerId) {
       return res.status(400).json({ error: 'No Stripe customer found. Subscribe first.' });
     }
-    const { url } = await createPortalSession(status.stripeCustomerId);
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const { url } = await createPortalSession(status.stripeCustomerId, origin);
     res.json({ url });
   } catch (err) {
     console.error('[Stripe] Portal session error:', err.message);
