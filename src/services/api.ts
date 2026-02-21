@@ -1,6 +1,6 @@
 import type { ProgressState, VideoChunk, SessionResponse, ChunkResponse, LoadMoreResponse } from '../types';
 import * as Sentry from '@sentry/react';
-import { auth } from '../firebase';
+import { auth } from '../firebase-auth';
 
 // API base URL - uses environment variable in production, relative path in development
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';

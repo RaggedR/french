@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import type { SRSCard, SRSRating } from '../types';
 import { sm2, previewInterval } from '../utils/sm2';
 import type { IntervalPreview } from '../utils/sm2';
+import type { DictionaryEntry } from '../types';
+import { RichCardBack } from './RichCardBack';
 
 interface ReviewPanelProps {
   isOpen: boolean;
@@ -31,7 +33,6 @@ function containsCyrillic(text: string): boolean {
 }
 
 // Extract the Russian and English sides of a card, regardless of which field holds which.
-// Returns { russian, english, russianSentence, englishSentence }.
 function getCardSides(card: SRSCard) {
   const wordIsCyrillic = containsCyrillic(card.word);
   return {
@@ -51,34 +52,33 @@ function formatPreview(preview: IntervalPreview): string {
   return `${(days / 365).toFixed(1)}y`;
 }
 
-// Render context sentence with the target word bolded
-function ContextSentence({ context, word }: { context: string; word: string }) {
-  // Find the word in the context (case-insensitive) and bold it
-  const lowerContext = context.toLowerCase();
-  const lowerWord = word.toLowerCase().replace(/[^а-яёА-ЯЁa-zA-Z]/g, '');
-  const idx = lowerContext.indexOf(lowerWord);
-
-  if (idx === -1) {
-    return <p className="text-sm text-gray-500 italic">{context}</p>;
-  }
-
-  const before = context.slice(0, idx);
-  const match = context.slice(idx, idx + lowerWord.length);
-  const after = context.slice(idx + lowerWord.length);
-
-  return (
-    <p className="text-sm text-gray-500 italic">
-      {before}<span className="font-semibold text-gray-700 not-italic">{match}</span>{after}
-    </p>
-  );
-}
-
 const RATINGS: { rating: SRSRating; label: string; color: string }[] = [
   { rating: 0, label: 'Again', color: 'bg-red-500 hover:bg-red-600' },
   { rating: 2, label: 'Hard', color: 'bg-orange-500 hover:bg-orange-600' },
   { rating: 4, label: 'Good', color: 'bg-green-500 hover:bg-green-600' },
   { rating: 5, label: 'Easy', color: 'bg-blue-500 hover:bg-blue-600' },
 ];
+
+// Map an SRSCard to a DictionaryEntry for the rich card back.
+// Uses stored dictionary data from OpenRussian when available,
+// falls back to basic translation-only entry for older cards.
+function cardToDictionaryEntry(card: SRSCard): DictionaryEntry {
+  const sides = getCardSides(card);
+  if (card.dictionary) {
+    return {
+      ...card.dictionary,
+      context: sides.russianSentence,
+      contextTranslation: sides.englishSentence,
+    };
+  }
+  return {
+    stressedForm: sides.russian,
+    pos: '',
+    translations: [sides.english],
+    context: sides.russianSentence,
+    contextTranslation: sides.englishSentence,
+  };
+}
 
 function CardContent({ card, showAnswer, reviewedCount, queueLength, onShowAnswer, onRate, onRemove }: {
   card: SRSCard;
@@ -90,6 +90,7 @@ function CardContent({ card, showAnswer, reviewedCount, queueLength, onShowAnswe
   onRemove: () => void;
 }) {
   const sides = getCardSides(card);
+  const entry = cardToDictionaryEntry(card);
 
   return (
     <div>
@@ -102,7 +103,7 @@ function CardContent({ card, showAnswer, reviewedCount, queueLength, onShowAnswe
         {queueLength > 0 && ` · ${queueLength} remaining`}
       </div>
 
-      {/* Front: Russian word + pronunciation + Russian sentence */}
+      {/* Front: Russian word + pronunciation */}
       <div className="text-center mb-4">
         <p className="text-3xl font-medium text-gray-900 mb-3">{sides.russian}</p>
         <button
@@ -117,12 +118,6 @@ function CardContent({ card, showAnswer, reviewedCount, queueLength, onShowAnswe
         </button>
       </div>
 
-      {sides.russianSentence && (
-        <div className="text-center mb-6 px-4">
-          <ContextSentence context={sides.russianSentence} word={sides.russian} />
-        </div>
-      )}
-
       {!showAnswer ? (
         <div className="text-center">
           <button
@@ -135,19 +130,14 @@ function CardContent({ card, showAnswer, reviewedCount, queueLength, onShowAnswe
         </div>
       ) : (
         <div>
-          {/* Back: English translation + English sentence */}
-          <div className="text-center mb-4 pb-4 border-t pt-4">
-            <p className="text-xl text-gray-700 mb-2">{sides.english}</p>
-          </div>
+          {/* Divider */}
+          <div className="border-t my-4" />
 
-          {sides.englishSentence && (
-            <div className="text-center mb-6 px-4">
-              <ContextSentence context={sides.englishSentence} word={sides.english} />
-            </div>
-          )}
+          {/* Rich card back */}
+          <RichCardBack entry={entry} />
 
           {/* Rating buttons */}
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid grid-cols-4 gap-2 mt-6">
             {RATINGS.map(({ rating, label, color }) => {
               const preview = previewInterval(card, rating);
               return (
@@ -247,7 +237,6 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
           if (readyItem) {
             if (timerRef.current) clearInterval(timerRef.current);
             timerRef.current = null;
-            // Re-trigger by setting queue — this will cause a re-render
             setQueue(q => {
               const idx = q.findIndex(i => i.card.id === readyItem.card.id);
               if (idx !== -1) {
@@ -291,13 +280,12 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
     const updated = sm2(card, rating);
 
     if (updated.repetition === 0) {
-      // Still in learning (Again or Hard on learning card, or Again on review card)
-      // Re-queue with a delay
+      // Still in learning — re-queue with a delay
       const delayMs = rating === 0 ? 60 * 1000 : 5 * 60 * 1000;
       setQueue(prev => [...prev, { card: updated, dueAt: Date.now() + delayMs }]);
       popNext();
     } else {
-      // Graduated or successful review — remove from queue
+      // Graduated or successful review — remove from this session's queue
       popNext();
     }
   }, [currentItem, onReview, popNext]);
@@ -379,13 +367,10 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
 
           {/* Body */}
           <div className="p-6">
-            {/* Empty state — no cards at all */}
+            {/* No cards due */}
             {totalInSession === 0 && (
               <div className="text-center py-12 text-gray-500">
-                <svg className="w-16 h-16 mx-auto mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-                    d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                </svg>
+                <div className="text-4xl mb-4">&#10003;</div>
                 <p className="text-lg font-medium mb-2">No cards due</p>
                 <p className="text-sm">
                   Click any word while reading, then press "Add to deck" to start learning.
@@ -417,7 +402,7 @@ export function ReviewPanel({ isOpen, onClose, dueCards, onReview, onRemove }: R
               </div>
             )}
 
-            {/* Card */}
+            {/* Real card — with new rich design */}
             {currentItem && <CardContent
               card={currentItem.card}
               showAnswer={showAnswer}

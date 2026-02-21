@@ -91,8 +91,8 @@ test.describe('API interactions — button → API call → response → UI upda
     // Wait for translation popup
     await expect(page.locator('text=to tell')).toBeVisible({ timeout: 5000 });
 
-    // Verify API was called with the correct word
-    expect(translateBody).toEqual({ word: 'рассказать' });
+    // Verify API was called with the correct word + lemma
+    expect(translateBody).toEqual({ word: 'рассказать', lemma: 'рассказать' });
 
     // Verify popup shows the word
     await expect(page.locator('.shadow-lg')).toBeVisible();

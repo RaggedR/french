@@ -46,6 +46,7 @@ vi.mock('./media.js', () => ({
   generateTtsAudio: vi.fn(),
   getAudioDuration: vi.fn(() => 30),
   estimateWordTimestamps: vi.fn(),
+  transcribeAndAlignTTS: vi.fn(),
 }));
 
 // Mock global fetch to simulate OpenAI API

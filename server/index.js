@@ -23,10 +23,11 @@ import {
   init as initSessionStore,
 } from './session-store.js';
 import { progressClients, sendProgress, createProgressCallback, friendlyErrorMessage } from './progress.js';
-import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps, BROWSER_UA } from './media.js';
+import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, transcribeAndAlignTTS, BROWSER_UA } from './media.js';
 import { requireAuth, adminAuth } from './auth.js';
 import { trackCost, requireBudget, costs, trackTranslateCost, initUsageStore, flushAllUsage, getUserCost, getUserWeeklyCost, getUserMonthlyCost, DAILY_LIMIT, WEEKLY_LIMIT, MONTHLY_LIMIT } from './usage.js';
 import { requireSubscription, getSubscriptionStatus, createCheckoutSession, createPortalSession, cancelSubscription, handleWebhook, constructWebhookEvent, initSubscriptionStore } from './stripe.js';
+import { initDictionary, lookupWord } from './dictionary.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -699,11 +700,11 @@ app.delete('/api/account', async (req, res) => {
 
 /**
  * POST /api/translate
- * Accepts: { word: string }
- * Returns: { word: string, translation: string, sourceLanguage: string }
+ * Accepts: { word: string, lemma?: string }
+ * Returns: { word: string, translation: string, sourceLanguage: string, dictionary?: object }
  */
 app.post('/api/translate', translateRateLimit, requireSubscription, requireBudget, async (req, res) => {
-  const { word } = req.body;
+  const { word, lemma } = req.body;
   const apiKey = process.env.GOOGLE_TRANSLATE_API_KEY;
 
   if (!word) {
@@ -720,9 +721,12 @@ app.post('/api/translate', translateRateLimit, requireSubscription, requireBudge
 
   const cacheKey = `ru:${word.toLowerCase()}`;
 
-  // Check cache
+  // Check cache (caches Google Translate result only — dictionary looked up fresh
+  // each time so updates to dictionary data are reflected immediately)
   if (translationCache.has(cacheKey)) {
-    return res.json(translationCache.get(cacheKey));
+    const cached = translationCache.get(cacheKey);
+    const dictionary = lookupWord(word, lemma) || undefined;
+    return res.json({ ...cached, dictionary });
   }
 
   try {
@@ -748,14 +752,19 @@ app.post('/api/translate', translateRateLimit, requireSubscription, requireBudge
     }
 
     const data = await response.json();
+
+    // Look up dictionary entry (in-memory, no cost)
+    const dictionary = lookupWord(word, lemma) || undefined;
+
     const result = {
       word,
       translation: data.data.translations[0].translatedText,
       sourceLanguage: 'ru',
+      dictionary,
     };
 
-    // Cache result
-    translationCache.set(cacheKey, result);
+    // Cache the Google Translate part only (dictionary looked up fresh on each request)
+    translationCache.set(cacheKey, { word, translation: result.translation, sourceLanguage: 'ru' });
     trackTranslateCost(req.uid, costs.translate(word.length));
 
     res.json(result);
@@ -1690,9 +1699,10 @@ app.post('/api/download-chunk', downloadChunkRateLimit, requireSubscription, req
       await generateTtsAudio(chunkText, audioPath, { onProgress });
       trackCost(req.uid, costs.tts(chunkText.length));
 
-      // Step 2: Get audio duration and estimate word timestamps proportionally
-      const duration = await getAudioDuration(audioPath);
-      const rawChunkTranscript = estimateWordTimestamps(chunkText, duration);
+      // Step 2: Transcribe TTS audio with Whisper for real word timestamps
+      const rawChunkTranscript = await transcribeAndAlignTTS(chunkText, audioPath, { onProgress });
+      const duration = rawChunkTranscript.duration;
+      trackCost(req.uid, costs.whisper(duration));
 
       // Lemmatize words for frequency matching
       const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress });
@@ -1887,8 +1897,9 @@ async function prefetchNextChunk(sessionId, currentChunkIndex) {
       const silentProgress = () => {};
       await generateTtsAudio(chunkText, audioPath, { onProgress: silentProgress });
       if (session.uid) { trackCost(session.uid, costs.tts(chunkText.length)); }
-      const duration = await getAudioDuration(audioPath);
-      const rawChunkTranscript = estimateWordTimestamps(chunkText, duration);
+      const rawChunkTranscript = await transcribeAndAlignTTS(chunkText, audioPath, { onProgress: silentProgress });
+      const duration = rawChunkTranscript.duration;
+      if (session.uid) { trackCost(session.uid, costs.whisper(duration)); }
       const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress: silentProgress });
       if (session.uid) { trackCost(session.uid, costs.gpt4o()); }
 
@@ -2015,6 +2026,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       .then(() => rebuildUrlCache())
       .then(() => initUsageStore())
       .then(() => initSubscriptionStore())
+      .then(() => initDictionary())
       .catch(err => {
         console.error('[Startup] Cleanup/cache/usage rebuild failed:', err.message);
       });

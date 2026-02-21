@@ -1,5 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
-import type { Transcript, WordTimestamp, Translation, TranslatorConfig } from '../types';
+import type { Transcript, WordTimestamp, Translation, TranslatorConfig, DictionaryEntry } from '../types';
 import { WordPopup } from './WordPopup';
 import { apiRequest } from '../services/api';
 
@@ -9,7 +9,7 @@ interface TranscriptPanelProps {
   config: TranslatorConfig;
   wordFrequencies?: Map<string, number>;
   isLoading?: boolean;
-  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string) => void;
+  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string, dictionary?: DictionaryEntry) => void;
   isWordInDeck?: (word: string) => boolean;
 }
 
@@ -141,6 +141,7 @@ export function TranscriptPanel({
           method: 'POST',
           body: JSON.stringify({
             word: word.word,
+            lemma: word.lemma,
           }),
         });
         setTranslation(data);

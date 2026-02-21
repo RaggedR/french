@@ -11,14 +11,16 @@ const mockSignInWithPopup = vi.fn();
 const mockSignOut = vi.fn();
 
 vi.mock('firebase/auth', () => ({
+  getAuth: vi.fn(() => ({ currentUser: null })),
   onAuthStateChanged: (...args: unknown[]) => mockOnAuthStateChanged(...args),
   signInWithPopup: (...args: unknown[]) => mockSignInWithPopup(...args),
+  signInWithRedirect: vi.fn(),
   signOut: (...args: unknown[]) => mockSignOut(...args),
   GoogleAuthProvider: class MockGoogleProvider {},
 }));
 
-vi.mock('../src/firebase', () => ({
-  auth: { currentUser: null },
+vi.mock('firebase/app', () => ({
+  initializeApp: vi.fn(() => ({})),
 }));
 
 // useAuth chooses between useAuthReal and useAuthE2E at module level

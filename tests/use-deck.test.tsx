@@ -13,6 +13,10 @@ vi.mock('firebase/firestore', () => ({
   getFirestore: vi.fn(),
 }));
 
+vi.mock('../src/firebase-db', () => ({
+  db: {},
+}));
+
 vi.mock('../src/firebase', () => ({
   db: {},
   auth: { currentUser: null },
@@ -62,6 +66,9 @@ describe('useDeck', () => {
   });
 
   it('loads cards from Firestore when userId provided', async () => {
+    // Dynamic import() inside getFirestoreHelpers() hangs with fake timers
+    // because Vitest's module loader uses async primitives that get frozen.
+    vi.useRealTimers();
     const firestoreCards = [
       { id: 'привет', word: 'Привет', translation: 'Hello', sourceLanguage: 'ru',
         easeFactor: 2.5, interval: 0, repetition: 0,
@@ -72,17 +79,18 @@ describe('useDeck', () => {
 
     const { result } = renderHook(() => useDeck('user-123'));
 
-    // Wait for the async Firestore load
     await act(async () => {
-      await vi.runAllTimersAsync();
+      await new Promise(r => setTimeout(r, 50));
     });
 
     expect(result.current.cards).toHaveLength(1);
     expect(result.current.cards[0].word).toBe('Привет');
     expect(result.current.loaded).toBe(true);
+    vi.useFakeTimers();
   });
 
   it('migrates localStorage deck to Firestore when Firestore is empty', async () => {
+    vi.useRealTimers(); // dynamic import() hangs with fake timers
     const localCards = [
       { id: 'мир', word: 'Мир', translation: 'World', sourceLanguage: 'ru',
         easeFactor: 2.5, interval: 0, repetition: 0,
@@ -95,7 +103,7 @@ describe('useDeck', () => {
     const { result } = renderHook(() => useDeck('user-456'));
 
     await act(async () => {
-      await vi.runAllTimersAsync();
+      await new Promise(r => setTimeout(r, 50));
     });
 
     // Cards loaded from localStorage
@@ -108,6 +116,7 @@ describe('useDeck', () => {
     );
     // localStorage cleared after migration
     expect(localStorage.getItem('srs_deck')).toBeNull();
+    vi.useFakeTimers();
   });
 
   it('falls back to localStorage when Firestore errors', async () => {

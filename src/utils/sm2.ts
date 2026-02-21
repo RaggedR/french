@@ -1,4 +1,4 @@
-import type { SRSCard, SRSRating } from '../types';
+import type { SRSCard, SRSRating, DictionaryEntry } from '../types';
 
 // Strip punctuation, lowercase, and normalize ё→е for deduplication.
 // Matches the normalizeWord() logic in TranscriptPanel.
@@ -6,7 +6,7 @@ export function normalizeCardId(word: string): string {
   return word.toLowerCase().replace(/[^а-яёа-яё]/g, '').replace(/ё/g, 'е');
 }
 
-export function createCard(word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string): SRSCard {
+export function createCard(word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string, dictionary?: DictionaryEntry): SRSCard {
   return {
     id: normalizeCardId(word),
     word,
@@ -14,6 +14,7 @@ export function createCard(word: string, translation: string, sourceLanguage: st
     sourceLanguage,
     context,
     contextTranslation,
+    dictionary,
     easeFactor: 2.5,
     interval: 0,
     repetition: 0,

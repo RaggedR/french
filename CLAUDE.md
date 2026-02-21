@@ -30,12 +30,17 @@ cd server && npx vitest run
 # Server tests in watch mode
 cd server && npx vitest
 
-# Run a single test file
+# Run a single server test file
 cd server && npx vitest run media.test.js
 cd server && npx vitest run integration.test.js
 
+# Run a single frontend test file
+npx vitest run tests/landing-page.test.tsx
+npx vitest run tests/app.test.tsx
+
 # Run tests matching a pattern
 cd server && npx vitest run -t "editDistance"
+npx vitest run -t "renders feature sections"
 
 # Integration tests against real APIs (requires network + API keys)
 cd server && npm run test:integration
@@ -65,8 +70,22 @@ cd e2e && npx playwright install chromium
 - `server/usage.test.js` — Unit tests for unified budget: cost tracking, requireBudget middleware, period resets, trackTranslateCost alias
 - `server/usage-persistence.test.js` — Tests Firestore persistence: debounced writes, schema migration from legacy separate budgets
 - `server/stripe.test.js` — Unit tests for Stripe subscription: status checks, middleware, checkout/portal sessions, webhook handling, cache invalidation
-- `server/integration.test.js` — Mocks `media.js`, tests all Express endpoints, SSE, session lifecycle, helmet headers, subscription endpoints
+- `server/dictionary.test.js` — Unit tests for OpenRussian dictionary: convertStress, lookupWord (noun/verb/adjective/other), lemma fallback, graceful no-op
+- `server/integration.test.js` — Mocks `media.js` + `dictionary.js`, tests all Express endpoints, SSE, session lifecycle, helmet headers, subscription endpoints
 - `e2e/tests/*.spec.ts` — Playwright E2E tests: app loading, video flow, text flow, demo flow, word popup, flashcard review, add-to-deck, settings features, subscription/paywall, security headers (CSP compliance), edge cases
+
+**Testing patterns:**
+- **Server integration tests** mock at the `media.js` boundary via `vi.mock()` — real Express routing, sessions, SSE, and chunking run against fake yt-dlp/Whisper/GPT responses. Auth is also mocked (`req.uid = 'test-user'`).
+- **E2E tests** intercept all network via Playwright's `page.route()` in `e2e/fixtures/mock-routes.ts` — `setupMockRoutes(page, { cached: true })` sets up mock API responses. Firebase is blocked (auth falls back to `useAuthE2E`, deck to localStorage).
+- **E2E auth bypass**: build-time `VITE_E2E_TEST` flag swaps real `useAuth` for a stateful mock. Tests can set `window.__E2E_NO_AUTH = true` via `addInitScript()` to start logged-out.
+- **Test isolation**: `clearAllCostsForTesting()` resets usage Maps; rate limiters disabled when `process.env.VITEST` is set.
+- **Frontend unit tests** use `@testing-library/react` + jsdom; setup file imports `@testing-library/jest-dom/vitest` matchers.
+
+## Related Documentation
+
+- `ARCHITECTURE.md` — Sequence diagrams for auth, video analysis, chunk download, flashcard, text mode, rate limiting flows
+- `CLAUDE_DOCS/` — Feature-specific docs (progressive disclosure format, one file per feature)
+- `README.md` — User-facing docs with feature overview, API costs, and quick start
 
 ## Setup
 
@@ -111,7 +130,7 @@ The frontend is a **thin client** — the backend owns all session state. The fr
 1. User pastes lib.ru URL (detected by url.includes('lib.ru'))
 2. POST /api/analyze → fetch text → split into ~3500-char chunks → generate TTS audio (OpenAI)
 3. AudioPlayer.tsx for playback, full-width transcript view (no side-by-side video)
-4. Word timestamps estimated from character offsets + audio duration
+4. Word timestamps from Whisper STT on TTS audio, aligned back to original text (transcribeAndAlignTTS)
 ```
 
 ### SSE Architecture
@@ -141,6 +160,7 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 - `auth.js` — Firebase Admin SDK token verification middleware (`requireAuth`)
 - `usage.js` — Per-user API cost tracking with daily/weekly/monthly limits
 - `stripe.js` — Stripe subscription management: checkout, webhooks, status checks, in-memory cache (5-min TTL)
+- `dictionary.js` — OpenRussian dictionary service: loads TSVs into `Map<bare, DictionaryEntry>`, exports `initDictionary()`, `lookupWord(word, lemma?)`, `convertStress()`
 
 **Authentication & Authorization:**
 - `requireAuth` middleware on all `/api/*` routes (except `/api/health`) — verifies Firebase ID tokens from `Authorization: Bearer` header or `?token=` query param (needed for SSE/EventSource). Sets `req.uid` and `req.userEmail`.
@@ -171,7 +191,6 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 - `helmet()` middleware: CSP report-only mode (logs violations, doesn't block), COOP `same-origin-allow-popups` (Firebase popup auth), CORP `cross-origin`, COEP disabled, HSTS preload, X-Frame-Options DENY. CSP headers stripped from `/__` Firebase auth proxy responses.
 - `/api/health` checks Firestore + GCS connectivity in production (returns 503 `degraded` if either fails)
 - Graceful shutdown on SIGTERM/SIGINT: flushes usage data to Firestore, drains connections, force-exits after 10s
-- SSE inactivity timeout (60s) on the frontend: if no events received, `EventSource` closes and falls back to polling
 
 **Input Validation & CORS:**
 - CORS whitelist: Cloud Run origin pattern, `localhost:5173`, `localhost:3001` (not open `cors()`)
@@ -182,7 +201,8 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 **Key patterns in `media.js`:**
 - `addPunctuation()` uses a two-pointer algorithm to align GPT-4o's punctuated output back to original Whisper word timestamps
 - `createHeartbeat()` sends periodic SSE updates during long-running operations (extraction, download, transcription)
-- `estimateWordTimestamps()` generates synthetic timestamps for TTS text mode (no Whisper timestamps available)
+- `transcribeAndAlignTTS()` runs Whisper on TTS audio then aligns back to original text via `alignWhisperToOriginal()` — produces accurate word timestamps for text mode
+- `estimateWordTimestamps()` generates synthetic timestamps by character length distribution (legacy fallback)
 
 **API Endpoints:**
 
@@ -199,7 +219,7 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 | POST | `/api/download-chunk` | auth + sub + owner + budget | Download a chunk (waits if prefetch in progress) |
 | POST | `/api/load-more-chunks` | auth + owner | Load next batch for long videos |
 | DELETE | `/api/session/:sessionId` | auth + owner | Delete session + all videos |
-| POST | `/api/translate` | auth + sub + budget | Google Translate proxy with caching |
+| POST | `/api/translate` | auth + sub + budget | Google Translate proxy with caching + OpenRussian dictionary lookup |
 | POST | `/api/extract-sentence` | auth + sub + budget | GPT-powered sentence extraction + translation |
 | GET | `/api/progress/:sessionId` | auth + owner | SSE stream for progress events |
 | GET | `/api/usage` | auth | Per-user unified API cost consumption (combined budget) |
@@ -219,13 +239,15 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 - `src/hooks/useSubscription.ts` — Fetches subscription status, provides subscribe/manage callbacks. E2E bypass via `window.__E2E_SUBSCRIPTION` override.
 - `src/components/PaywallScreen.tsx` — Shown when trial expired or subscription canceled. Subscribe button redirects to Stripe Checkout.
 - `src/components/SettingsPanel.tsx` — Accepts `cards`, `userId`, `onDeleteAccount`, `subscription`, `onManageSubscription`, `onSubscribe` props. Features: frequency range config, deck export, subscription status display (trial countdown, manage button), API usage bars, collapsible legal docs, account deletion.
-- `src/components/LandingPage.tsx` — Public marketing page with hero, features grid, pricing, and "Get Started" CTA that triggers Google Sign-In. Expandable ToS/Privacy in footer.
+- `src/components/LandingPage.tsx` — Public marketing page with hero, features grid, pricing, and "Get Started" CTA that triggers Google Sign-In. Expandable ToS/Privacy in footer. Note: legal `data-testid`s retain `login-` prefix (e.g. `login-tos-link`) for E2E compatibility — inherited from the deleted `LoginScreen`.
 
 ### SRS Flashcard System
 
 - `src/hooks/useDeck.ts` — Deck state with Firestore persistence (debounced 500ms writes). Accepts `userId` from `useAuth`. Falls back to localStorage if Firestore is unavailable. Migrates existing localStorage data to Firestore on first load.
 - `src/hooks/useAuth.ts` — Google Sign-In via `signInWithPopup` + `GoogleAuthProvider`. Tracks state via `onAuthStateChanged`. Returns `{ userId, user, isLoading, signInWithGoogle, signOut }`. E2E test bypass: build-time `VITE_E2E_TEST` selects stateful `useAuthE2E` (supports sign-out). Tests can set `window.__E2E_NO_AUTH = true` via `addInitScript` to start logged-out.
-- `src/firebase.ts` — Firebase app/auth/firestore initialization. Config from `VITE_FIREBASE_*` env vars.
+- `src/firebase-auth.ts` — Firebase app + auth initialization (eager, loaded at boot). Config from `VITE_FIREBASE_*` env vars.
+- `src/firebase-db.ts` — Firestore initialization (lazy, dynamically imported by `useDeck.ts` to defer ~107KB gz).
+- `src/firebase.ts` — Re-export barrel (`auth` + `db`) for backwards compatibility (test mocks use this path).
 - `src/utils/sm2.ts` — SM-2 spaced repetition algorithm with Anki-like learning steps (1min/5min) and graduated review intervals.
 - `src/components/ReviewPanel.tsx` — Flashcard review UI with keyboard shortcuts (1-4 for ratings, Space/Enter for show/good).
 - `firestore.rules` — Security rules: `decks/{userId}` read/write by matching `auth.uid` (write requires `cards` is list); `usage/{userId}` read/delete by matching `auth.uid`; `subscriptions/{userId}` read/delete by matching `auth.uid`. Deploy with `firebase deploy --only firestore:rules`.
@@ -233,7 +255,7 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 
 ### Word Frequency Highlighting
 
-- `public/russian-word-frequencies.json` — 92K Russian words sorted by frequency rank
+- `public/russian-word-frequencies.json` — ~20K Russian lemmas from the Russian National Corpus (Lyashevskaya & Sharoff), sorted by frequency rank
 - `TranscriptPanel` underlines words in a configurable frequency rank range (e.g., rank 500–1000)
 - Normalization: ё→е for both frequency lookup and card deduplication (`normalizeCardId` in `sm2.ts`)
 
@@ -283,6 +305,19 @@ GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`
 - Stripe (subscription payments via Checkout redirect + Customer Portal + webhooks)
 - yt-dlp + ffmpeg (video/audio processing)
 
+## Adding a New Endpoint
+
+New API endpoints in `server/index.js` follow a standard middleware chain. Pick the middleware your endpoint needs:
+
+```
+requireAuth                              → all endpoints (except /api/health, /api/webhook)
+requireAuth + requireSubscription        → endpoints that need active subscription
+requireAuth + requireSubscription + requireBudget → endpoints that call external APIs (cost money)
+requireAuth + requireSessionOwnership    → endpoints that access a specific session
+```
+
+After adding the endpoint, add corresponding tests in `server/integration.test.js` (mock at `media.js` boundary) and E2E route handling in `e2e/fixtures/mock-routes.ts`.
+
 ## Important Behavioral Rules
 
 - **Word click = translate only, NOT seek.** Clicking a word in the transcript shows a translation popup. It must NOT seek/jump the video to that word's timestamp. The video continues playing normally.
@@ -294,22 +329,9 @@ GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`
 - **Local sessions**: In-memory only, lost on restart (production persists to GCS)
 - **ok.ru extraction**: Takes 90-120s due to anti-bot JS protection (`ESTIMATED_EXTRACTION_TIME = 100`)
 
-## Production Roadmap
+## Roadmap
 
-### Completed
-- ~~Migrate from Firebase Anonymous Auth to Google OAuth~~ (PR #8)
-- ~~Per-user rate limiting + cost tracking~~ (PR #8)
-- ~~CI/CD: GitHub Actions for lint, test, deploy~~ (PR #15)
-- ~~Session security: crypto.randomUUID(), session ownership, access validation~~
-- ~~Sentry error monitoring~~ (PR #16)
-- ~~Production hardening: SSRF, CORS, input validation, concurrency limits~~ (PR #18)
-- ~~Legal docs, usage UI, deck export, account deletion, GCP monitoring~~ (PR #19)
-- ~~Pre-processed demo content, health check, graceful shutdown, SSE timeout~~ (PR #20)
-- ~~Unified API budget: merged Google Translate + OpenAI into single pool~~ (PR #37)
-- ~~Helmet.js security headers: CSP report-only, COOP/CORP for Firebase compatibility~~ (PR #37)
-- ~~Stripe subscription: $5/month, 30-day free trial, paywall, webhooks~~
-
-### Future
 - Switch CSP from report-only to enforcing mode (after production verification)
 - Import deck functionality (export already implemented)
+- Rename `login-` prefix `data-testid`s in LandingPage to `landing-` (coordinated E2E update)
 - Android app (React Native or PWA wrapper)

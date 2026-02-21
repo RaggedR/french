@@ -166,7 +166,7 @@ describe('TranscriptPanel', () => {
     await waitFor(() => {
       expect(apiRequest).toHaveBeenCalledWith('/api/translate', {
         method: 'POST',
-        body: JSON.stringify({ word: 'рассказать' }),
+        body: JSON.stringify({ word: 'рассказать', lemma: 'рассказать' }),
       });
     });
   });

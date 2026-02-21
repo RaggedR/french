@@ -4,6 +4,7 @@ import { TERMS_OF_SERVICE, PRIVACY_POLICY } from '../legal';
 interface LandingPageProps {
   onSignIn: () => void;
   error?: string | null;
+  isSigningIn?: boolean;
 }
 
 function GoogleIcon() {
@@ -29,7 +30,7 @@ function GoogleIcon() {
   );
 }
 
-export function LandingPage({ onSignIn, error }: LandingPageProps) {
+export function LandingPage({ onSignIn, error, isSigningIn }: LandingPageProps) {
   const [expandedLegal, setExpandedLegal] = useState<'tos' | 'privacy' | null>(null);
 
   return (
@@ -43,15 +44,22 @@ export function LandingPage({ onSignIn, error }: LandingPageProps) {
         <p className="text-lg text-gray-600 mb-8 max-w-xl mx-auto">
           Watch Russian videos and read texts with synced transcripts, click-to-translate, and spaced repetition flashcards.
         </p>
-        <button
-          data-testid="get-started-btn"
-          onClick={onSignIn}
-          aria-label="Get Started with Google Sign-In"
-          className="inline-flex items-center gap-3 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-base font-medium shadow-sm"
-        >
-          <GoogleIcon />
-          Get Started
-        </button>
+        {isSigningIn ? (
+          <div className="flex flex-col items-center gap-4" data-testid="signing-in-indicator">
+            <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div>
+            <p className="text-gray-600 text-base">Loading... Please wait</p>
+          </div>
+        ) : (
+          <button
+            data-testid="get-started-btn"
+            onClick={onSignIn}
+            aria-label="Get Started with Google Sign-In"
+            className="inline-flex items-center gap-3 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-base font-medium shadow-sm"
+          >
+            <GoogleIcon />
+            Get Started
+          </button>
+        )}
         {error && (
           <p className="mt-4 text-sm text-red-600">{error}</p>
         )}

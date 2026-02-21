@@ -1,11 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock firebase before importing api.ts
-vi.mock('../src/firebase', () => ({
-  auth: {
-    currentUser: null,
-  },
-}));
+// api.ts imports from firebase-auth directly; barrel re-exports for test access
+const mockAuth = vi.hoisted(() => ({ currentUser: null as unknown }));
+vi.mock('../src/firebase-auth', () => ({ auth: mockAuth }));
+vi.mock('../src/firebase', () => ({ auth: mockAuth }));
 
 import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk, loadMoreChunks, deleteSession } from '../src/services/api';
 import { auth } from '../src/firebase';

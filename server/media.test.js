@@ -2,17 +2,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createHeartbeat, editDistance, isFuzzyMatch, stripPunctuation,
   isLibRuUrl, estimateWordTimestamps, alignWhisperToOriginal, addPunctuation,
+  transcribeAndAlignTTS,
 } from './media.js';
 
-// Shared mock for OpenAI chat.completions.create — vi.hoisted runs before vi.mock
-const { mockChatCreate } = vi.hoisted(() => ({
+// Shared mocks for OpenAI — vi.hoisted runs before vi.mock
+const { mockChatCreate, mockTranscriptionsCreate } = vi.hoisted(() => ({
   mockChatCreate: vi.fn(),
+  mockTranscriptionsCreate: vi.fn(),
 }));
 
 vi.mock('openai', () => ({
   default: class MockOpenAI {
     constructor() {}
     chat = { completions: { create: mockChatCreate } };
+    audio = { transcriptions: { create: mockTranscriptionsCreate } };
   },
 }));
 
@@ -619,5 +622,128 @@ describe('addPunctuation', () => {
     // Should report start (0%) and complete (100%)
     expect(onProgress).toHaveBeenCalledWith('punctuation', 0, 'active', expect.stringContaining('1 words'));
     expect(onProgress).toHaveBeenCalledWith('punctuation', 100, 'complete', expect.any(String));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// transcribeAndAlignTTS
+// ---------------------------------------------------------------------------
+
+// Mock fs for transcribeAndAlignTTS tests (transcribeAudioChunk reads the audio file)
+vi.mock('fs', async () => {
+  const actual = await vi.importActual('fs');
+  return {
+    ...actual,
+    default: {
+      ...actual.default,
+      statSync: vi.fn((p) => {
+        // Return fake stats for test audio paths
+        if (p.includes('test-audio')) {
+          return { size: 1024 * 1024 }; // 1MB
+        }
+        return actual.default.statSync(p);
+      }),
+      createReadStream: vi.fn((p) => {
+        if (p.includes('test-audio')) {
+          // Return a minimal readable stream stub
+          const { Readable } = require('stream');
+          return Readable.from(['fake-audio-data']);
+        }
+        return actual.default.createReadStream(p);
+      }),
+    },
+  };
+});
+
+describe('transcribeAndAlignTTS', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockTranscriptionsCreate.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('calls Whisper then aligns to original text, returning correct shape', async () => {
+    mockTranscriptionsCreate.mockResolvedValue({
+      words: [
+        { word: 'Привет', start: 0.0, end: 0.5 },
+        { word: 'мир', start: 0.6, end: 1.0 },
+      ],
+      segments: [{ text: 'Привет мир', start: 0, end: 1.0 }],
+      language: 'ru',
+      duration: 1.0,
+    });
+
+    const resultPromise = transcribeAndAlignTTS('Привет мир', '/tmp/test-audio.mp3', {
+      apiKey: 'test-key',
+    });
+    // Advance past the progress interval
+    vi.advanceTimersByTime(5000);
+    const result = await resultPromise;
+
+    expect(result.words).toHaveLength(2);
+    expect(result.words[0].word).toBe('Привет');
+    expect(result.words[0].start).toBe(0.0);
+    expect(result.words[0].end).toBe(0.5);
+    expect(result.words[1].word).toBe(' мир');
+    expect(result.words[1].start).toBe(0.6);
+    expect(result.words[1].end).toBe(1.0);
+    expect(result.segments).toHaveLength(1);
+    expect(result.language).toBe('ru');
+    expect(result.duration).toBe(1.0);
+  });
+
+  it('builds segments of ~20 words each', async () => {
+    // Create 45 whisper words
+    const whisperWords = Array.from({ length: 45 }, (_, i) => ({
+      word: `слово${i}`,
+      start: i * 0.5,
+      end: (i + 1) * 0.5,
+    }));
+    mockTranscriptionsCreate.mockResolvedValue({
+      words: whisperWords,
+      segments: [],
+      language: 'ru',
+      duration: 22.5,
+    });
+
+    const text = Array.from({ length: 45 }, (_, i) => `слово${i}`).join(' ');
+    const resultPromise = transcribeAndAlignTTS(text, '/tmp/test-audio.mp3', {
+      apiKey: 'test-key',
+    });
+    vi.advanceTimersByTime(5000);
+    const result = await resultPromise;
+
+    // 45 words / 20 per segment = 3 segments (20, 20, 5)
+    expect(result.segments).toHaveLength(3);
+    expect(result.words).toHaveLength(45);
+    expect(result.duration).toBe(22.5);
+  });
+
+  it('handles Whisper mishearing words via fuzzy alignment', async () => {
+    // Whisper hears "привед" instead of "привет" (common mishearing)
+    mockTranscriptionsCreate.mockResolvedValue({
+      words: [
+        { word: 'привед', start: 0.0, end: 0.5 },
+        { word: 'мир', start: 0.6, end: 1.0 },
+      ],
+      segments: [],
+      language: 'ru',
+      duration: 1.0,
+    });
+
+    const resultPromise = transcribeAndAlignTTS('привет мир', '/tmp/test-audio.mp3', {
+      apiKey: 'test-key',
+    });
+    vi.advanceTimersByTime(5000);
+    const result = await resultPromise;
+
+    // Should use original text "привет" with Whisper timestamp
+    expect(result.words[0].word).toBe('привет');
+    expect(result.words[0].start).toBe(0.0);
+    expect(result.words[1].word).toBe(' мир');
+    expect(result.words[1].start).toBe(0.6);
   });
 });

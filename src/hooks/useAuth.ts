@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut, GoogleAuthProvider } from 'firebase/auth';
-import { auth } from '../firebase';
+import { onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut as firebaseSignOut, GoogleAuthProvider } from 'firebase/auth';
+import { auth } from '../firebase-auth';
 
 export interface AuthUser {
   displayName: string | null;
@@ -50,6 +50,11 @@ function useAuthReal(): AuthState {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err: any) {
+      if (err.code === 'auth/popup-blocked') {
+        // Browser blocked the popup — fall back to full-page redirect
+        await signInWithRedirect(auth, googleProvider);
+        return;
+      }
       setAuthError(`${err.code} — ${err.message}`);
     }
   }, []);

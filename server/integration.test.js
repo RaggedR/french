@@ -81,6 +81,15 @@ vi.mock('./stripe.js', () => ({
 import { getSubscriptionStatus, createCheckoutSession } from './stripe.js';
 
 // ---------------------------------------------------------------------------
+// Mock dictionary.js — bypass CSV loading in tests
+// ---------------------------------------------------------------------------
+
+vi.mock('./dictionary.js', () => ({
+  initDictionary: vi.fn().mockResolvedValue(undefined),
+  lookupWord: vi.fn().mockReturnValue(null),
+}));
+
+// ---------------------------------------------------------------------------
 // Mock media.js — replaces all 5 external-facing functions
 // ---------------------------------------------------------------------------
 
@@ -108,6 +117,15 @@ vi.mock('./media.js', () => {
       language: 'ru',
       duration,
     })),
+    transcribeAndAlignTTS: vi.fn((text) => {
+      const words = text.split(/\s+/).map((w, i) => ({ word: (i > 0 ? ' ' : '') + w, start: i * 0.5, end: (i + 1) * 0.5 }));
+      return Promise.resolve({
+        words,
+        segments: [{ text, start: 0, end: words.length * 0.5 }],
+        language: 'ru',
+        duration: words.length * 0.5,
+      });
+    }),
     alignWhisperToOriginal: vi.fn(() => []),
     // String utility functions used by index.js
     stripPunctuation: vi.fn((w) => w),
@@ -129,6 +147,7 @@ import {
   generateTtsAudio,
   getAudioDuration,
   estimateWordTimestamps,
+  transcribeAndAlignTTS,
 } from './media.js';
 
 // Import server after mocks are set up
@@ -1036,6 +1055,20 @@ describe('K. Text Mode (lib.ru) Analysis', () => {
       language: 'ru',
       duration,
     }));
+    transcribeAndAlignTTS.mockImplementation(async (text) => {
+      const duration = 30;
+      const words = text.split(/\s+/);
+      return {
+        words: words.map((w, i) => ({
+          word: (i > 0 ? ' ' : '') + w,
+          start: (i / words.length) * duration,
+          end: ((i + 1) / words.length) * duration,
+        })),
+        segments: [{ text, start: 0, end: duration }],
+        language: 'ru',
+        duration,
+      };
+    });
     lemmatizeWords.mockImplementation(async (t) => t);
   }
 
@@ -1084,9 +1117,9 @@ describe('K. Text Mode (lib.ru) Analysis', () => {
     expect(dlBody.transcript).toBeTruthy();
     expect(dlBody.transcript.words.length).toBeGreaterThan(0);
 
-    // Verify TTS was called
+    // Verify TTS + Whisper transcription pipeline was called
     expect(generateTtsAudio).toHaveBeenCalled();
-    expect(getAudioDuration).toHaveBeenCalled();
+    expect(transcribeAndAlignTTS).toHaveBeenCalled();
   });
 });
 

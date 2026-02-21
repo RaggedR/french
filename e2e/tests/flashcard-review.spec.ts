@@ -25,7 +25,7 @@ test.describe('Flashcard review (regression tests)', () => {
     await expect(page.locator('text=привет').first()).toBeVisible({ timeout: 3000 });
 
     // English translation should NOT be visible before reveal
-    await expect(page.locator('.text-xl:has-text("hello")')).not.toBeVisible();
+    await expect(page.locator('.text-lg:has-text("hello")')).not.toBeVisible();
   });
 
   test('clicking "Show Answer" reveals English translation', async ({ page }) => {
@@ -42,8 +42,8 @@ test.describe('Flashcard review (regression tests)', () => {
     // Click "Show Answer"
     await page.locator('text=Show Answer').click();
 
-    // English translation should now be visible (in the .text-xl element)
-    await expect(page.locator('.text-xl:has-text("hello")')).toBeVisible();
+    // English translation should now be visible (in the .text-lg element via RichCardBack)
+    await expect(page.locator('.text-lg:has-text("hello")')).toBeVisible();
 
     // Rating buttons should appear
     await expect(page.getByRole('button', { name: /Again/ })).toBeVisible();
@@ -86,13 +86,14 @@ test.describe('Flashcard review (regression tests)', () => {
     const deckBadge = page.locator('button[title*="review"], button[title*="due"]');
     await deckBadge.click();
 
-    // Russian context sentence should be visible on front
-    await expect(page.locator('text=как дела')).toBeVisible();
+    // Context sentences NOT visible before reveal (RichCardBack renders on back only)
+    await expect(page.locator('text=как дела')).not.toBeVisible();
 
     // Show answer
     await page.locator('text=Show Answer').click();
 
-    // English context sentence should be visible on back
+    // Both context sentences visible after reveal via RichCardBack
+    await expect(page.locator('text=как дела')).toBeVisible();
     await expect(page.locator('text=how are you')).toBeVisible();
   });
 
@@ -111,7 +112,7 @@ test.describe('Flashcard review (regression tests)', () => {
 
     // Space → show answer
     await page.keyboard.press('Space');
-    await expect(page.locator('.text-xl:has-text("hello")')).toBeVisible();
+    await expect(page.locator('.text-lg:has-text("hello")')).toBeVisible();
 
     // Click the "Good" button directly (keyboard events may not reach modal reliably)
     await page.getByRole('button', { name: /Good/ }).click();

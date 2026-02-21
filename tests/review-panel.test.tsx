@@ -29,9 +29,9 @@ function getFrontWord(container: HTMLElement): string {
   return el?.textContent ?? '';
 }
 
-function getBackWord(container: HTMLElement): string {
-  // The back word is in the border-t section (revealed after Show Answer)
-  const el = container.querySelector('.border-t .text-xl');
+function getBackTranslation(container: HTMLElement): string {
+  // RichCardBack renders translations in .text-lg after the .text-2xl stressed form
+  const el = container.querySelector('.text-lg.text-gray-700');
   return el?.textContent ?? '';
 }
 
@@ -63,7 +63,7 @@ describe('ReviewPanel flashcard direction', () => {
 
     fireEvent.click(screen.getByText('Show Answer'));
 
-    expect(getBackWord(container)).toBe('hello');
+    expect(getBackTranslation(container)).toBe('hello');
   });
 
   it('shows English on the back after clicking Show Answer (normal fields)', () => {
@@ -72,10 +72,10 @@ describe('ReviewPanel flashcard direction', () => {
 
     fireEvent.click(screen.getByText('Show Answer'));
 
-    expect(getBackWord(container)).toBe('hello');
+    expect(getBackTranslation(container)).toBe('hello');
   });
 
-  it('shows Russian sentence on front and English sentence on back when fields are swapped', () => {
+  it('shows context sentences on the back after clicking Show Answer (swapped fields)', () => {
     const card = makeCard({
       word: 'hello',
       translation: 'привет',
@@ -84,18 +84,18 @@ describe('ReviewPanel flashcard direction', () => {
     });
     const { container } = render(<ReviewPanel {...defaultProps} dueCards={[card]} />);
 
-    // Russian sentence visible on front
-    expect(container.textContent).toContain('Скажи');
-    // English sentence NOT visible before reveal
+    // Sentences NOT visible before reveal (RichCardBack only renders on back)
+    expect(container.textContent).not.toContain('Скажи привет');
     expect(container.textContent).not.toContain('Say hello');
 
     fireEvent.click(screen.getByText('Show Answer'));
 
-    // English sentence visible after reveal
+    // Both sentences visible after reveal via RichCardBack
+    expect(container.textContent).toContain('Скажи привет');
     expect(container.textContent).toContain('Say hello');
   });
 
-  it('shows Russian sentence on front and English sentence on back when fields are normal', () => {
+  it('shows context sentences on the back after clicking Show Answer (normal fields)', () => {
     const card = makeCard({
       word: 'привет',
       translation: 'hello',
@@ -104,14 +104,13 @@ describe('ReviewPanel flashcard direction', () => {
     });
     const { container } = render(<ReviewPanel {...defaultProps} dueCards={[card]} />);
 
-    // Russian sentence visible on front
-    expect(container.textContent).toContain('Скажи');
-    // English sentence NOT visible before reveal
+    // Sentences NOT visible before reveal
     expect(container.textContent).not.toContain('Say hello');
 
     fireEvent.click(screen.getByText('Show Answer'));
 
-    // English sentence visible after reveal
+    // Both sentences visible after reveal via RichCardBack
+    expect(container.textContent).toContain('Скажи привет');
     expect(container.textContent).toContain('Say hello');
   });
 });
