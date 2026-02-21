@@ -34,6 +34,7 @@ export function LandingPage({ onSignIn, error }: LandingPageProps) {
 
   return (
     <div className="min-h-screen bg-gray-50">
+      <main>
       {/* Hero */}
       <section className="px-4 pt-16 pb-12 text-center max-w-3xl mx-auto">
         <h1 className="text-4xl font-bold text-gray-900 mb-4">
@@ -45,6 +46,7 @@ export function LandingPage({ onSignIn, error }: LandingPageProps) {
         <button
           data-testid="get-started-btn"
           onClick={onSignIn}
+          aria-label="Get Started with Google Sign-In"
           className="inline-flex items-center gap-3 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-base font-medium shadow-sm"
         >
           <GoogleIcon />
@@ -120,6 +122,7 @@ export function LandingPage({ onSignIn, error }: LandingPageProps) {
             <p className="text-4xl font-bold text-gray-900">$5<span className="text-lg font-normal text-gray-500">/month</span></p>
             <p className="text-gray-600 mt-2">30-day free trial — no card required</p>
             <button
+              data-testid="get-started-btn-pricing"
               onClick={onSignIn}
               className="mt-6 w-full inline-flex items-center justify-center gap-3 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-base font-medium shadow-sm"
             >
@@ -129,6 +132,7 @@ export function LandingPage({ onSignIn, error }: LandingPageProps) {
           </div>
         </div>
       </section>
+      </main>
 
       {/* Footer with legal */}
       <footer className="px-4 py-8 border-t bg-white">
