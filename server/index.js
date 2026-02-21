@@ -216,7 +216,8 @@ app.get('/api/health', async (req, res) => {
       const firestore = getFirestore();
       await firestore.listCollections();
       checks.firestore = true;
-    } catch {
+    } catch (err) {
+      console.error('[Health] Firestore check failed:', err.message);
       checks.firestore = false;
     }
   }
@@ -224,9 +225,10 @@ app.get('/api/health', async (req, res) => {
   // Verify GCS connectivity in production
   if (!IS_LOCAL && bucket) {
     try {
-      await bucket.getMetadata();
+      await bucket.getFiles({ maxResults: 1 });
       checks.gcsConnected = true;
-    } catch {
+    } catch (err) {
+      console.error('[Health] GCS check failed:', err.message);
       checks.gcsConnected = false;
     }
   }
