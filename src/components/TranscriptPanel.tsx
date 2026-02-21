@@ -9,7 +9,7 @@ interface TranscriptPanelProps {
   config: TranslatorConfig;
   wordFrequencies?: Map<string, number>;
   isLoading?: boolean;
-  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string) => void;
+  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string, dictionary?: import('../types').DictionaryEntry) => void;
   isWordInDeck?: (word: string) => boolean;
 }
 
@@ -141,6 +141,7 @@ export function TranscriptPanel({
           method: 'POST',
           body: JSON.stringify({
             word: word.word,
+            lemma: word.lemma,
           }),
         });
         setTranslation(data);

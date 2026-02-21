@@ -130,6 +130,7 @@ describe('WordPopup', () => {
         'ru',
         'Привет, как дела?',        // extracted sentence
         'Hello, how are you?',       // context translation
+        undefined,                   // dictionary (not in mock)
       );
     });
 
@@ -154,7 +155,7 @@ describe('WordPopup', () => {
 
     await waitFor(() => {
       // Should fall back to calling without sentence/contextTranslation
-      expect(onAddToDeck).toHaveBeenCalledWith('привет', 'hello', 'ru');
+      expect(onAddToDeck).toHaveBeenCalledWith('привет', 'hello', 'ru', undefined, undefined, undefined);
     });
   });
 
@@ -170,7 +171,7 @@ describe('WordPopup', () => {
     fireEvent.click(screen.getByText('Add to deck'));
 
     await waitFor(() => {
-      expect(onAddToDeck).toHaveBeenCalledWith('привет', 'hello', 'ru', undefined, undefined);
+      expect(onAddToDeck).toHaveBeenCalledWith('привет', 'hello', 'ru', undefined, undefined, undefined);
     });
 
     // extract-sentence should NOT be called

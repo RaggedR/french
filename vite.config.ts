@@ -7,6 +7,28 @@ import { sentryVitePlugin } from '@sentry/vite-plugin'
 export default defineConfig({
   build: {
     sourcemap: 'hidden', // Generate for Sentry upload, don't expose in prod
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/react/') || id.includes('node_modules/react-dom/') || id.includes('node_modules/scheduler/')) {
+            return 'react-vendor';
+          }
+          if (id.includes('node_modules/firebase/auth') || id.includes('node_modules/@firebase/auth') ||
+              id.includes('node_modules/firebase/app') || id.includes('node_modules/@firebase/app') ||
+              id.includes('node_modules/@firebase/util') || id.includes('node_modules/@firebase/logger') ||
+              id.includes('node_modules/@firebase/component') || id.includes('node_modules/idb/')) {
+            return 'firebase-auth';
+          }
+          if (id.includes('node_modules/firebase/firestore') || id.includes('node_modules/@firebase/firestore') ||
+              id.includes('node_modules/@firebase/webchannel-wrapper')) {
+            return 'firebase-firestore';
+          }
+          if (id.includes('node_modules/@sentry/') || id.includes('node_modules/@sentry-internal/')) {
+            return 'sentry';
+          }
+        },
+      },
+    },
   },
   plugins: [
     react(),

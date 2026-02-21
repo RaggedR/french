@@ -245,7 +245,7 @@ describe('App', () => {
   // ─── Auth gate ──────────────────────────────────────────
 
   describe('Auth gate', () => {
-    it('shows loading spinner when auth is loading', () => {
+    it('shows LandingPage immediately while auth is loading (no spinner)', () => {
       mockedUseAuth.mockReturnValue({
         userId: null,
         user: null,
@@ -254,9 +254,8 @@ describe('App', () => {
         signOut: mockSignOut,
       });
 
-      const { container } = render(<App />);
-      expect(container.querySelector('.animate-spin')).not.toBeNull();
-      expect(screen.queryByTestId('landing-page')).toBeNull();
+      render(<App />);
+      expect(screen.getByTestId('landing-page')).toBeInTheDocument();
       expect(screen.queryByTestId('video-input')).toBeNull();
     });
 

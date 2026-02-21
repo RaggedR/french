@@ -32,8 +32,7 @@ import {
   isLibRuUrl,
   fetchLibRuText,
   generateTtsAudio,
-  getAudioDuration,
-  estimateWordTimestamps,
+  transcribeAndAlignTTS,
 } from '../media.js';
 import { createChunks, createTextChunks, getChunkTranscript } from '../chunking.js';
 
@@ -188,10 +187,9 @@ async function generateTextDemo() {
 
     // Generate TTS
     await generateTtsAudio(chunk.text, audioPath, { onProgress: silentProgress });
-    const duration = await getAudioDuration(audioPath);
 
-    // Estimate word timestamps
-    const rawChunkTranscript = estimateWordTimestamps(chunk.text, duration);
+    // Transcribe TTS audio with Whisper for real word timestamps (costs ~$0.006/min)
+    const rawChunkTranscript = await transcribeAndAlignTTS(chunk.text, audioPath);
 
     // Lemmatize
     const chunkTranscript = await lemmatizeWords(rawChunkTranscript, { onProgress: silentProgress });

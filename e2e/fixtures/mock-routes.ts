@@ -104,7 +104,7 @@ export async function setupMockRoutes(page: Page, options: {
     });
   });
 
-  // POST /api/translate → translation
+  // POST /api/translate → translation + dictionary
   await page.route('**/api/translate', async (route) => {
     const body = route.request().postDataJSON();
     await route.fulfill({
@@ -114,6 +114,7 @@ export async function setupMockRoutes(page: Page, options: {
         word: body?.word || MOCK_TRANSLATION.word,
         translation: MOCK_TRANSLATION.translation,
         sourceLanguage: 'ru',
+        dictionary: MOCK_TRANSLATION.dictionary,
       }),
     });
   });

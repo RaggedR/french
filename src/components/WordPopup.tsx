@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import type { Translation } from '../types';
+import type { Translation, DictionaryEntry } from '../types';
 import { apiRequest } from '../services/api';
 
 interface WordPopupProps {
@@ -8,7 +8,7 @@ interface WordPopupProps {
   error: string | null;
   position: { x: number; y: number } | null;
   onClose: () => void;
-  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string) => void;
+  onAddToDeck?: (word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string, dictionary?: DictionaryEntry) => void;
   isInDeck?: boolean;
   context?: string;
 }
@@ -62,10 +62,10 @@ export function WordPopup({
         sentence = data.sentence;
         contextTranslation = data.translation;
       }
-      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, sentence, contextTranslation);
+      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, sentence, contextTranslation, translation.dictionary);
     } catch {
       // Still add without sentence if extraction fails
-      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage);
+      onAddToDeck(translation.word, translation.translation, translation.sourceLanguage, undefined, undefined, translation.dictionary);
     } finally {
       setIsAddingToDeck(false);
     }

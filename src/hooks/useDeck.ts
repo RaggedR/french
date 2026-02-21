@@ -1,12 +1,24 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import * as Sentry from '@sentry/react';
-import { db } from '../firebase';
-import type { SRSCard, SRSRating } from '../types';
+import type { SRSCard, SRSRating, DictionaryEntry } from '../types';
 import { createCard, sm2, getDueCards as getDueCardsFromAll, normalizeCardId } from '../utils/sm2';
 
 const DECK_KEY = 'srs_deck';
 const DEBOUNCE_MS = 500;
+
+async function getFirestoreHelpers() {
+  const [firestoreModule, { db }] = await Promise.all([
+    import('firebase/firestore'),
+    import('../firebase-db'),
+  ]);
+  return {
+    doc: firestoreModule.doc,
+    getDoc: firestoreModule.getDoc,
+    setDoc: firestoreModule.setDoc,
+    serverTimestamp: firestoreModule.serverTimestamp,
+    db,
+  };
+}
 
 function loadLocalDeck(): SRSCard[] {
   try {
@@ -42,19 +54,19 @@ export function useDeck(userId: string | null) {
   const saveToFirestore = useCallback((nextCards: SRSCard[]) => {
     if (!userId) return;
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      const deckRef = doc(db, 'decks', userId);
-      setDoc(deckRef, { cards: nextCards, updatedAt: serverTimestamp() })
-        .then(() => {
-          setSaveError(null);
-        })
-        .catch((err) => {
-          console.error('[useDeck] Firestore save failed:', err);
-          Sentry.captureException(err, { tags: { operation: 'deck_save' } });
-          setSaveError('Deck changes may not be saved — check your connection');
-          // Fallback: persist to localStorage so data survives a refresh
-          saveLocalBackup(nextCards);
-        });
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const { doc, setDoc, serverTimestamp, db } = await getFirestoreHelpers();
+        const deckRef = doc(db, 'decks', userId);
+        await setDoc(deckRef, { cards: nextCards, updatedAt: serverTimestamp() });
+        setSaveError(null);
+      } catch (err) {
+        console.error('[useDeck] Firestore save failed:', err);
+        Sentry.captureException(err, { tags: { operation: 'deck_save' } });
+        setSaveError('Deck changes may not be saved — check your connection');
+        // Fallback: persist to localStorage so data survives a refresh
+        saveLocalBackup(nextCards);
+      }
     }, DEBOUNCE_MS);
   }, [userId]);
 
@@ -65,8 +77,9 @@ export function useDeck(userId: string | null) {
     let cancelled = false;
 
     async function load() {
-      const deckRef = doc(db, 'decks', userId!);
       try {
+        const { doc, getDoc, setDoc, serverTimestamp, db } = await getFirestoreHelpers();
+        const deckRef = doc(db, 'decks', userId!);
         const snap = await getDoc(deckRef);
         if (cancelled) return;
 
@@ -109,11 +122,11 @@ export function useDeck(userId: string | null) {
   const dueCards = useMemo(() => getDueCardsFromAll(cards), [cards]);
   const dueCount = dueCards.length;
 
-  const addCard = useCallback((word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string) => {
+  const addCard = useCallback((word: string, translation: string, sourceLanguage: string, context?: string, contextTranslation?: string, dictionary?: DictionaryEntry) => {
     setCards(prev => {
       const id = normalizeCardId(word);
       if (prev.some(c => c.id === id)) return prev; // duplicate
-      const next = [...prev, createCard(word, translation, sourceLanguage, context, contextTranslation)];
+      const next = [...prev, createCard(word, translation, sourceLanguage, context, contextTranslation, dictionary)];
       saveToFirestore(next);
       return next;
     });

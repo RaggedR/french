@@ -16,6 +16,9 @@ server/*.vtt
 # Demo media files (generated, too large for git)
 server/demo/media/
 
+# OpenRussian dictionary CSVs (downloaded at build time, ~21MB)
+server/data/openrussian/
+
 # Logs
 logs
 *.log

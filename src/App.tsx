@@ -1,17 +1,19 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { VideoInput } from './components/VideoInput';
 import { TextInput } from './components/TextInput';
-import { VideoPlayer } from './components/VideoPlayer';
-import { AudioPlayer } from './components/AudioPlayer';
-import { TranscriptPanel } from './components/TranscriptPanel';
-import { SettingsPanel } from './components/SettingsPanel';
 import { ChunkMenu } from './components/ChunkMenu';
 import { ProgressBar } from './components/ProgressBar';
 import { DeckBadge } from './components/DeckBadge';
-import { ReviewPanel } from './components/ReviewPanel';
 import { LandingPage } from './components/LandingPage';
 import { PaywallScreen } from './components/PaywallScreen';
 import { useDeck } from './hooks/useDeck';
+
+// Lazy-loaded components — only for views the user navigates to AFTER initial render
+const SettingsPanel = lazy(() => import('./components/SettingsPanel').then(m => ({ default: m.SettingsPanel })));
+const ReviewPanel = lazy(() => import('./components/ReviewPanel').then(m => ({ default: m.ReviewPanel })));
+const VideoPlayer = lazy(() => import('./components/VideoPlayer').then(m => ({ default: m.VideoPlayer })));
+const AudioPlayer = lazy(() => import('./components/AudioPlayer').then(m => ({ default: m.AudioPlayer })));
+const TranscriptPanel = lazy(() => import('./components/TranscriptPanel').then(m => ({ default: m.TranscriptPanel })));
 import { useAuth } from './hooks/useAuth';
 import { useSubscription } from './hooks/useSubscription';
 import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk, loadMoreChunks, deleteAccount, loadDemo } from './services/api';
@@ -78,7 +80,7 @@ function FrequencyControls({ config, onConfigChange }: {
           <input
             type="number"
             min={1}
-            max={92709}
+            max={20003}
             value={config.freqRangeMin ?? ''}
             onChange={(e) => onConfigChange({
               ...config,
@@ -90,7 +92,7 @@ function FrequencyControls({ config, onConfigChange }: {
           <input
             type="number"
             min={1}
-            max={92709}
+            max={20003}
             value={config.freqRangeMax ?? ''}
             onChange={(e) => onConfigChange({
               ...config,
@@ -100,6 +102,14 @@ function FrequencyControls({ config, onConfigChange }: {
           />
         </div>
       )}
+    </div>
+  );
+}
+
+function TopProgressBar() {
+  return (
+    <div className="fixed top-0 left-0 right-0 z-50 h-1.5 bg-blue-100 overflow-hidden">
+      <div className="h-full bg-blue-500 animate-indeterminate" style={{ width: '40%' }} />
     </div>
   );
 }
@@ -169,6 +179,7 @@ function App() {
   // Error state
   const [error, setError] = useState<string | null>(null);
   const [localAuthError, setAuthError] = useState<string | null>(null);
+  const [isSigningIn, setIsSigningIn] = useState(false);
 
   useEffect(() => {
     saveSettings(config);
@@ -713,43 +724,37 @@ function App() {
     setProgress([]);
   }, []);
 
-  // Auth loading state
-  if (authLoading) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div>
-      </div>
-    );
-  }
-
-  // Login gate — must sign in before using the app
+  // Show LandingPage immediately during auth loading AND when not logged in.
+  // No spinner — user sees real content instantly instead of waiting for
+  // Firebase Auth's network round-trip to check cached sessions.
   if (!userId) {
     return (
-      <LandingPage
-        onSignIn={() => {
-          setAuthError(null);
-          signInWithGoogle().catch((err) => {
-            // Don't show error for user-cancelled popups
-            if (err?.code !== 'auth/popup-closed-by-user') {
-              setAuthError(err instanceof Error ? err.message : 'Sign-in failed');
-            }
-          });
-        }}
-        error={authError || localAuthError}
-      />
-    );
-  }
-
-  // Subscription loading state
-  if (subLoading) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div>
-      </div>
+      <>
+        {authLoading && <TopProgressBar />}
+        <LandingPage
+          isSigningIn={isSigningIn}
+          onSignIn={() => {
+            setAuthError(null);
+            setIsSigningIn(true);
+            signInWithGoogle()
+              .catch((err) => {
+                // Don't show error for user-cancelled popups
+                if (err?.code !== 'auth/popup-closed-by-user') {
+                  setAuthError(err instanceof Error ? err.message : 'Sign-in failed');
+                }
+              })
+              .finally(() => {
+                setIsSigningIn(false);
+              });
+          }}
+          error={authError || localAuthError}
+        />
+      </>
     );
   }
 
   // Paywall gate — must have active subscription or trial
+  // Skip the spinner while subscription loads — show the app optimistically.
   if (needsPayment) {
     return (
       <PaywallScreen
@@ -763,6 +768,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gray-50">
+      {subLoading && <TopProgressBar />}
       {/* Header */}
       <header className="bg-white shadow-sm">
         <div className="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
@@ -1040,6 +1046,7 @@ function App() {
 
             {/* Text mode: audio + full-width transcript */}
             {contentType === 'text' && audioUrl && (
+              <Suspense fallback={<div className="flex justify-center py-12"><div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div></div>}>
               <div className="space-y-4">
                 <AudioPlayer url={audioUrl} onTimeUpdate={setCurrentTime} />
                 <div className="bg-white rounded-lg shadow-sm">
@@ -1059,10 +1066,12 @@ function App() {
                   <FrequencyControls config={config} onConfigChange={setConfig} />
                 </div>
               </div>
+              </Suspense>
             )}
 
             {/* Video mode: video + transcript side-by-side */}
             {contentType === 'video' && videoUrl && (
+              <Suspense fallback={<div className="flex justify-center py-12"><div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div></div>}>
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div>
                   <VideoPlayer
@@ -1088,33 +1097,38 @@ function App() {
                   <FrequencyControls config={config} onConfigChange={setConfig} />
                 </div>
               </div>
+              </Suspense>
             )}
           </div>
         )}
       </main>
 
       {/* Settings panel */}
-      <SettingsPanel
-        config={config}
-        onConfigChange={setConfig}
-        isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-        cards={cards}
-        userId={userId}
-        onDeleteAccount={handleDeleteAccount}
-        subscription={subscription}
-        onManageSubscription={handleManageSubscription}
-        onSubscribe={handleSubscribe}
-      />
+      <Suspense fallback={null}>
+        <SettingsPanel
+          config={config}
+          onConfigChange={setConfig}
+          isOpen={isSettingsOpen}
+          onClose={() => setIsSettingsOpen(false)}
+          cards={cards}
+          userId={userId}
+          onDeleteAccount={handleDeleteAccount}
+          subscription={subscription}
+          onManageSubscription={handleManageSubscription}
+          onSubscribe={handleSubscribe}
+        />
+      </Suspense>
 
       {/* Review panel */}
-      <ReviewPanel
-        isOpen={isReviewOpen}
-        onClose={() => setIsReviewOpen(false)}
-        dueCards={dueCards}
-        onReview={reviewCard}
-        onRemove={removeCard}
-      />
+      <Suspense fallback={null}>
+        <ReviewPanel
+          isOpen={isReviewOpen}
+          onClose={() => setIsReviewOpen(false)}
+          dueCards={dueCards}
+          onReview={reviewCard}
+          onRemove={removeCard}
+        />
+      </Suspense>
     </div>
   );
 }

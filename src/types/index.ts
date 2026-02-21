@@ -1,7 +1,45 @@
+// ── Dictionary types (from OpenRussian data) ─────────────────────────
+
+export interface NounDeclension {
+  sg: { nom: string; gen: string; dat: string; acc: string; inst: string; prep: string };
+  pl: { nom: string; gen: string; dat: string; acc: string; inst: string; prep: string };
+}
+
+export interface VerbConjugation {
+  present: { sg1: string; sg2: string; sg3: string; pl1: string; pl2: string; pl3: string };
+  past: { m: string; f: string; n?: string; pl: string };
+  imperative: { sg: string; pl: string };
+}
+
+export interface AdjectiveForms {
+  long: { m: string; f: string; n: string; pl: string };
+  short: { m: string; f: string; n: string; pl: string };
+  comparative?: string;
+  superlative?: string;
+}
+
+export interface DictionaryEntry {
+  stressedForm: string;
+  pos: string;
+  gender?: string;
+  aspect?: string;
+  aspectPair?: string;
+  translations: string[];
+  declension?: NounDeclension;
+  conjugation?: VerbConjugation;
+  adjectiveForms?: AdjectiveForms;
+  example?: { russian: string; english: string };
+  context?: string;
+  contextTranslation?: string;
+}
+
+// ── API response types ───────────────────────────────────────────────
+
 export interface Translation {
   word: string;
   translation: string;
   sourceLanguage: string;
+  dictionary?: DictionaryEntry;
 }
 
 export interface TranslatorConfig {
@@ -97,6 +135,7 @@ export interface SRSCard {
   sourceLanguage: string;
   context?: string;          // example sentence from transcript (Russian)
   contextTranslation?: string; // translated sentence (English)
+  dictionary?: DictionaryEntry; // rich grammar data from OpenRussian
   easeFactor: number;        // starts 2.5, min 1.3
   interval: number;          // days until next review
   repetition: number;        // consecutive correct recalls

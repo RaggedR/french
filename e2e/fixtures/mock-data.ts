@@ -87,10 +87,17 @@ export const MOCK_SINGLE_CHUNK = [
   },
 ];
 
+export const MOCK_DICTIONARY = {
+  stressedForm: 'приве\u0301т',
+  pos: 'other',
+  translations: ['hello', 'hi', 'greeting'],
+};
+
 export const MOCK_TRANSLATION = {
   word: 'Привет,',
   translation: 'Hello',
   sourceLanguage: 'ru',
+  dictionary: MOCK_DICTIONARY,
 };
 
 export const MOCK_SENTENCE = {

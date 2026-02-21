@@ -1309,3 +1309,37 @@ export function alignWhisperToOriginal(whisperWords, originalWords) {
 
   return result;
 }
+
+/**
+ * Transcribe TTS audio with Whisper and align back to original text.
+ * Produces accurate word-level timestamps instead of character-proportional estimates.
+ *
+ * @param {string} text - Original text that was synthesized to audio
+ * @param {string} audioPath - Path to the TTS audio file
+ * @param {object} options - Passed through to transcribeAudioChunk (onProgress, apiKey, language)
+ * @returns {Promise<{words: Array<{word: string, start: number, end: number}>, segments: Array, language: string, duration: number}>}
+ */
+export async function transcribeAndAlignTTS(text, audioPath, options = {}) {
+  const whisperResult = await transcribeAudioChunk(audioPath, options);
+
+  const originalWords = text.split(/\s+/).filter(w => w.length > 0);
+  const alignedWords = alignWhisperToOriginal(whisperResult.words, originalWords);
+
+  // Build segments (~20 words each), same shape as estimateWordTimestamps
+  const segments = [];
+  for (let i = 0; i < alignedWords.length; i += 20) {
+    const segWords = alignedWords.slice(i, i + 20);
+    segments.push({
+      text: segWords.map(w => w.word).join('').trim(),
+      start: segWords[0].start,
+      end: segWords[segWords.length - 1].end,
+    });
+  }
+
+  return {
+    words: alignedWords,
+    segments,
+    language: whisperResult.language || 'ru',
+    duration: whisperResult.duration,
+  };
+}
