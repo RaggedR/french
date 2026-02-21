@@ -86,10 +86,20 @@ vi.mock('../src/components/ReviewPanel', () => ({
   ),
 }));
 
+vi.mock('../src/components/PaywallScreen', () => ({
+  PaywallScreen: ({ onSubscribe, onSignOut }: any) => (
+    <div data-testid="paywall-screen">
+      <button data-testid="subscribe-btn" onClick={onSubscribe}>Subscribe</button>
+      <button data-testid="paywall-sign-out" onClick={onSignOut}>Sign out</button>
+    </div>
+  ),
+}));
+
 // ─── Mock hooks and services ──────────────────────────────
 
 vi.mock('../src/hooks/useAuth', () => ({ useAuth: vi.fn() }));
 vi.mock('../src/hooks/useDeck', () => ({ useDeck: vi.fn() }));
+vi.mock('../src/hooks/useSubscription', () => ({ useSubscription: vi.fn() }));
 vi.mock('../src/services/api', () => ({
   apiRequest: vi.fn(),
   subscribeToProgress: vi.fn(),
@@ -97,6 +107,19 @@ vi.mock('../src/services/api', () => ({
   getChunk: vi.fn(),
   downloadChunk: vi.fn(),
   loadMoreChunks: vi.fn(),
+  getSubscription: vi.fn().mockResolvedValue({
+    status: 'trialing',
+    trialEnd: new Date(Date.now() + 25 * 24 * 60 * 60 * 1000).toISOString(),
+    trialDaysRemaining: 25,
+    currentPeriodEnd: null,
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    needsPayment: false,
+    price: 5,
+    priceDisplay: '$5/month',
+  }),
+  createCheckoutSession: vi.fn().mockResolvedValue({ url: 'https://checkout.stripe.com/test' }),
+  createPortalSession: vi.fn().mockResolvedValue({ url: 'https://billing.stripe.com/test' }),
 }));
 
 // ─── Imports (receive mocked versions) ────────────────────
@@ -104,6 +127,7 @@ vi.mock('../src/services/api', () => ({
 import App from '../src/App';
 import { useAuth } from '../src/hooks/useAuth';
 import { useDeck } from '../src/hooks/useDeck';
+import { useSubscription } from '../src/hooks/useSubscription';
 import {
   apiRequest,
   subscribeToProgress,
@@ -117,6 +141,7 @@ import {
 
 const mockedUseAuth = vi.mocked(useAuth);
 const mockedUseDeck = vi.mocked(useDeck);
+const mockedUseSubscription = vi.mocked(useSubscription);
 const mockedApiRequest = vi.mocked(apiRequest);
 const mockedSubscribeToProgress = vi.mocked(subscribeToProgress);
 const mockedGetSession = vi.mocked(getSession);
@@ -168,6 +193,26 @@ describe('App', () => {
       signInWithGoogle: mockSignInWithGoogle,
       signOut: mockSignOut,
     });
+
+    // Default: active trial subscription
+    mockedUseSubscription.mockReturnValue({
+      subscription: {
+        status: 'trialing',
+        trialEnd: new Date(Date.now() + 25 * 24 * 60 * 60 * 1000).toISOString(),
+        trialDaysRemaining: 25,
+        currentPeriodEnd: null,
+        stripeCustomerId: null,
+        stripeSubscriptionId: null,
+        needsPayment: false,
+        price: 5,
+        priceDisplay: '$5/month',
+      },
+      isLoading: false,
+      needsPayment: false,
+      handleSubscribe: vi.fn(),
+      handleManageSubscription: vi.fn(),
+      refetch: vi.fn(),
+    } as any);
 
     // Default: empty deck
     mockedUseDeck.mockReturnValue({

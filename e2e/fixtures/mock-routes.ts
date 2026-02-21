@@ -133,9 +133,9 @@ export async function setupMockRoutes(page: Page, options: {
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
-        daily: { used: 0.55, limit: 1.00 },    // Combined: 0.45 (OpenAI) + 0.10 (Translate)
-        weekly: { used: 1.60, limit: 5.00 },   // Combined: 1.20 + 0.40
-        monthly: { used: 4.50, limit: 10.00 }, // Combined: 3.50 + 1.00
+        daily: { used: 0.25, limit: 0.50 },    // Combined: 0.20 (OpenAI) + 0.05 (Translate)
+        weekly: { used: 0.80, limit: 2.50 },   // Combined: 0.60 + 0.20
+        monthly: { used: 2.25, limit: 5.00 },  // Combined: 1.75 + 0.50
       }),
     });
   });
@@ -149,6 +149,43 @@ export async function setupMockRoutes(page: Page, options: {
         body: JSON.stringify({ success: true }),
       });
     }
+  });
+
+  // GET /api/subscription → trialing with no payment needed (default)
+  await page.route('**/api/subscription', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'trialing',
+        trialEnd: new Date(Date.now() + 25 * 24 * 60 * 60 * 1000).toISOString(),
+        trialDaysRemaining: 25,
+        currentPeriodEnd: null,
+        stripeCustomerId: null,
+        stripeSubscriptionId: null,
+        needsPayment: false,
+        price: 5,
+        priceDisplay: '$5/month',
+      }),
+    });
+  });
+
+  // POST /api/create-checkout-session → mock checkout URL
+  await page.route('**/api/create-checkout-session', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ url: 'https://checkout.stripe.com/test' }),
+    });
+  });
+
+  // POST /api/create-portal-session → mock portal URL
+  await page.route('**/api/create-portal-session', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ url: 'https://billing.stripe.com/test' }),
+    });
   });
 
   // GET /api/progress/:sessionId → SSE stream (immediate connected + complete)

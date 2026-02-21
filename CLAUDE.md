@@ -62,9 +62,11 @@ cd e2e && npx playwright install chromium
 **Test files:**
 - `tests/typecheck.test.js` — Runs `tsc -b` to catch TypeScript errors (30s timeout)
 - `server/media.test.js` — Unit tests for heartbeat, stripPunctuation, editDistance, isFuzzyMatch
-- `server/usage.test.js` — Unit tests for cost tracking, budget middleware, limit constants
-- `server/integration.test.js` — Mocks `media.js`, tests all Express endpoints, SSE, session lifecycle
-- `e2e/tests/*.spec.ts` — Playwright E2E tests: app loading, video flow, text flow, demo flow, word popup, flashcard review, add-to-deck, settings features, edge cases
+- `server/usage.test.js` — Unit tests for unified budget: cost tracking, requireBudget middleware, period resets, trackTranslateCost alias
+- `server/usage-persistence.test.js` — Tests Firestore persistence: debounced writes, schema migration from legacy separate budgets
+- `server/stripe.test.js` — Unit tests for Stripe subscription: status checks, middleware, checkout/portal sessions, webhook handling, cache invalidation
+- `server/integration.test.js` — Mocks `media.js`, tests all Express endpoints, SSE, session lifecycle, helmet headers, subscription endpoints
+- `e2e/tests/*.spec.ts` — Playwright E2E tests: app loading, video flow, text flow, demo flow, word popup, flashcard review, add-to-deck, settings features, subscription/paywall, security headers (CSP compliance), edge cases
 
 ## Setup
 
@@ -80,6 +82,9 @@ cd e2e && npx playwright install chromium
    VITE_FIREBASE_STORAGE_BUCKET=...
    VITE_FIREBASE_MESSAGING_SENDER_ID=...
    VITE_FIREBASE_APP_ID=...
+   STRIPE_SECRET_KEY=sk_test_...
+   STRIPE_WEBHOOK_SECRET=whsec_...
+   STRIPE_PRICE_ID=price_...
    ```
 4. Deploy Firestore security rules: `firebase deploy --only firestore:rules`
 
@@ -135,17 +140,32 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 - `chunking.js` — Splits transcripts at natural pauses (>0.5s gaps), targets ~3min chunks
 - `auth.js` — Firebase Admin SDK token verification middleware (`requireAuth`)
 - `usage.js` — Per-user API cost tracking with daily/weekly/monthly limits
+- `stripe.js` — Stripe subscription management: checkout, webhooks, status checks, in-memory cache (5-min TTL)
 
 **Authentication & Authorization:**
 - `requireAuth` middleware on all `/api/*` routes (except `/api/health`) — verifies Firebase ID tokens from `Authorization: Bearer` header or `?token=` query param (needed for SSE/EventSource). Sets `req.uid` and `req.userEmail`.
 - `requireSessionOwnership` middleware on all session endpoints — verifies `session.uid === req.uid`. Returns 403 for mismatched or missing uid. Attaches `req.analysisSession` and `req.sessionId` so handlers skip redundant lookups.
 - Session IDs are `crypto.randomUUID()` (122 bits of entropy, not guessable).
 
+**Subscription & Payments:**
+- Stripe Checkout (redirect mode) for payments, Stripe Customer Portal for management
+- 30-day free trial (no card required), then $5/month subscription
+- `requireSubscription` middleware on `/api/analyze`, `/api/translate`, `/api/extract-sentence`, `/api/download-chunk`
+- Subscription status in Firestore `subscriptions/{userId}`, synced via Stripe webhooks
+- In-memory cache (5-min TTL) avoids Firestore reads on every request
+- Webhook route registered before `express.json()` (raw body for signature verification)
+- Env vars: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID`
+
 **Rate Limiting & Budget:**
 - Per-user rate limiters keyed on `req.uid` (disabled during tests via `process.env.VITEST`)
-- OpenAI budget: $1/day, $5/week, $10/month per user (`requireBudget` middleware)
-- Google Translate budget: $0.50/day, $2.50/week, $5/month (`requireTranslateBudget`)
-- Costs tracked in-memory with Firestore write-behind persistence (5s debounce per user). `flushAllUsage()` writes all pending data on graceful shutdown (SIGTERM/SIGINT). `initUsageStore()` hydrates from Firestore on startup. See `server/usage.js` for per-call estimates.
+- **Unified API budget**: $0.50/day, $2.50/week, $5/month per user (combined for all API calls: Whisper, GPT-4o, TTS, Google Translate)
+- `requireBudget` middleware enforces limits on all API-consuming endpoints
+- Costs tracked in-memory with Firestore write-behind persistence (5s debounce per user)
+- `flushAllUsage()` writes all pending data on graceful shutdown (SIGTERM/SIGINT)
+- `initUsageStore()` hydrates from Firestore on startup with automatic migration from legacy separate budgets
+- `trackTranslateCost()` is a backwards-compatible alias for `trackCost()`
+- `clearAllCostsForTesting()` test utility clears all Maps for test isolation
+- See `server/usage.js` for per-call cost estimates
 
 **Security & Production Hardening:**
 - `helmet()` middleware: CSP report-only mode (logs violations, doesn't block), COOP `same-origin-allow-popups` (Firebase popup auth), CORP `cross-origin`, COEP disabled, HSTS preload, X-Frame-Options DENY. CSP headers stripped from `/__` Firebase auth proxy responses.
@@ -169,16 +189,20 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 | Method | Endpoint | Auth | Purpose |
 |--------|----------|------|---------|
 | GET | `/api/health` | — | Health check |
-| POST | `/api/analyze` | auth + budget | Start analysis (returns cached per-user if URL seen) |
+| POST | `/api/webhook` | — (Stripe-signed) | Stripe webhook handler (raw body, before express.json) |
+| GET | `/api/subscription` | auth | Get subscription status (trial, active, etc.) |
+| POST | `/api/create-checkout-session` | auth | Create Stripe Checkout session, returns redirect URL |
+| POST | `/api/create-portal-session` | auth | Create Stripe Customer Portal session |
+| POST | `/api/analyze` | auth + sub + budget | Start analysis (returns cached per-user if URL seen) |
 | GET | `/api/session/:sessionId` | auth + owner | Get session data + chunk statuses |
 | GET | `/api/session/:sessionId/chunk/:chunkId` | auth + owner | Get ready chunk's video URL + transcript |
-| POST | `/api/download-chunk` | auth + owner + budget | Download a chunk (waits if prefetch in progress) |
+| POST | `/api/download-chunk` | auth + sub + owner + budget | Download a chunk (waits if prefetch in progress) |
 | POST | `/api/load-more-chunks` | auth + owner | Load next batch for long videos |
 | DELETE | `/api/session/:sessionId` | auth + owner | Delete session + all videos |
-| POST | `/api/translate` | auth + translate budget | Google Translate proxy with caching |
-| POST | `/api/extract-sentence` | auth + budget | GPT-powered sentence extraction + translation |
+| POST | `/api/translate` | auth + sub + budget | Google Translate proxy with caching |
+| POST | `/api/extract-sentence` | auth + sub + budget | GPT-powered sentence extraction + translation |
 | GET | `/api/progress/:sessionId` | auth + owner | SSE stream for progress events |
-| GET | `/api/usage` | auth | Per-user API cost consumption (OpenAI + Translate) |
+| GET | `/api/usage` | auth | Per-user unified API cost consumption (combined budget) |
 | DELETE | `/api/account` | auth | Delete account: Firestore + GCS + in-memory + Auth cleanup |
 | POST | `/api/demo` | auth | Load pre-processed demo (no budget — no API calls) |
 | GET | `/api/local-video/:filename` | auth | Serve local demo video files (dev only) |
@@ -188,11 +212,13 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 
 ### Frontend
 
-- `App.tsx` — State machine managing view transitions, SSE subscriptions. Two content modes: `video` (ok.ru) and `text` (lib.ru)
-- `src/services/api.ts` — API client with SSE + polling fallback. Exports `getUsage()`, `deleteAccount()`, `loadDemo()`.
+- `App.tsx` — State machine managing view transitions, SSE subscriptions. Two content modes: `video` (ok.ru) and `text` (lib.ru). Subscription loading gate + paywall gate between login and main app.
+- `src/services/api.ts` — API client with SSE + polling fallback. Exports `getUsage()`, `deleteAccount()`, `loadDemo()`, `getSubscription()`, `createCheckoutSession()`, `createPortalSession()`.
 - `src/types/index.ts` — Shared types: `WordTimestamp`, `Transcript`, `VideoChunk`, `SessionResponse`, `ProgressState`, `SRSCard`
 - `src/legal.ts` — `TERMS_OF_SERVICE` and `PRIVACY_POLICY` string constants, used in both `SettingsPanel` and `LoginScreen`
-- `src/components/SettingsPanel.tsx` — Accepts `cards`, `userId`, `onDeleteAccount` props. Features: frequency range config, deck export (JSON Blob download), usage bars (color-coded: green/yellow/red), collapsible legal docs, account deletion with "DELETE" confirmation.
+- `src/hooks/useSubscription.ts` — Fetches subscription status, provides subscribe/manage callbacks. E2E bypass via `window.__E2E_SUBSCRIPTION` override.
+- `src/components/PaywallScreen.tsx` — Shown when trial expired or subscription canceled. Subscribe button redirects to Stripe Checkout.
+- `src/components/SettingsPanel.tsx` — Accepts `cards`, `userId`, `onDeleteAccount`, `subscription`, `onManageSubscription`, `onSubscribe` props. Features: frequency range config, deck export, subscription status display (trial countdown, manage button), API usage bars, collapsible legal docs, account deletion.
 - `src/components/LoginScreen.tsx` — Google Sign-In button with expandable ToS/Privacy agreement text
 
 ### SRS Flashcard System
@@ -202,7 +228,7 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 - `src/firebase.ts` — Firebase app/auth/firestore initialization. Config from `VITE_FIREBASE_*` env vars.
 - `src/utils/sm2.ts` — SM-2 spaced repetition algorithm with Anki-like learning steps (1min/5min) and graduated review intervals.
 - `src/components/ReviewPanel.tsx` — Flashcard review UI with keyboard shortcuts (1-4 for ratings, Space/Enter for show/good).
-- `firestore.rules` — Security rules: `decks/{userId}` read/write by matching `auth.uid` (write requires `cards` is list); `usage/{userId}` read/delete by matching `auth.uid`. Deploy with `firebase deploy --only firestore:rules`.
+- `firestore.rules` — Security rules: `decks/{userId}` read/write by matching `auth.uid` (write requires `cards` is list); `usage/{userId}` read/delete by matching `auth.uid`; `subscriptions/{userId}` read/delete by matching `auth.uid`. Deploy with `firebase deploy --only firestore:rules`.
 - Sentence extraction: scans the words array for sentence-ending punctuation (`.!?…`) to extract only the containing sentence as flashcard context, not the full Whisper segment.
 
 ### Word Frequency Highlighting
@@ -254,6 +280,7 @@ GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`
 - Firebase Google Sign-In + Firestore (flashcard persistence)
 - OpenAI Whisper API (transcription) + GPT-4o (punctuation/spelling) + TTS (text mode audio)
 - Google Translate API, Google Cloud Storage
+- Stripe (subscription payments via Checkout redirect + Customer Portal + webhooks)
 - yt-dlp + ffmpeg (video/audio processing)
 
 ## Important Behavioral Rules
@@ -278,14 +305,9 @@ GCP project: `russian-transcription`, Cloud Run service: `russian-transcription`
 - ~~Production hardening: SSRF, CORS, input validation, concurrency limits~~ (PR #18)
 - ~~Legal docs, usage UI, deck export, account deletion, GCP monitoring~~ (PR #19)
 - ~~Pre-processed demo content, health check, graceful shutdown, SSE timeout~~ (PR #20)
-
-### In Progress
-- **Google Sign-In broken on production** — debugging. Use `./quick-deploy.sh` to push directly to main while iterating on this fix. Auth errors now displayed on login screen.
-- **Helmet.js re-enabled (report-only CSP)** — helmet active with COOP `same-origin-allow-popups`, CORP `cross-origin`, CSP in report-only mode. CSP stripped from `/__` Firebase auth proxy responses. After verifying no violations in production, switch CSP to enforcing mode.
-
-### Payment (Priority: HIGH — Next)
-- Add Stripe subscription: $10/month, first month free
-- Enforce usage quotas per tier (free trial vs paid)
+- ~~Unified API budget: merged Google Translate + OpenAI into single pool~~ (PR #37)
+- ~~Helmet.js security headers: CSP report-only, COOP/CORP for Firebase compatibility~~ (PR #37)
+- ~~Stripe subscription: $5/month, 30-day free trial, paywall, webhooks~~
 
 ### Future
 - Switch CSP from report-only to enforcing mode (after production verification)

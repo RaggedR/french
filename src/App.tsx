@@ -10,8 +10,10 @@ import { ProgressBar } from './components/ProgressBar';
 import { DeckBadge } from './components/DeckBadge';
 import { ReviewPanel } from './components/ReviewPanel';
 import { LoginScreen } from './components/LoginScreen';
+import { PaywallScreen } from './components/PaywallScreen';
 import { useDeck } from './hooks/useDeck';
 import { useAuth } from './hooks/useAuth';
+import { useSubscription } from './hooks/useSubscription';
 import { apiRequest, subscribeToProgress, getSession, getChunk, downloadChunk, loadMoreChunks, deleteAccount, loadDemo } from './services/api';
 import type {
   TranslatorConfig,
@@ -155,8 +157,9 @@ function App() {
   const [config, setConfig] = useState<TranslatorConfig>(loadSettings);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
-  // Auth + Spaced repetition deck
+  // Auth + Subscription + Spaced repetition deck
   const { userId, user, isLoading: authLoading, authError, signInWithGoogle, signOut } = useAuth();
+  const { subscription, isLoading: subLoading, needsPayment, handleSubscribe, handleManageSubscription, refetch: refetchSubscription } = useSubscription(userId);
   const { cards, dueCards, dueCount, addCard, removeCard, reviewCard, isWordInDeck, saveError, clearSaveError } = useDeck(userId);
   const [isReviewOpen, setIsReviewOpen] = useState(false);
 
@@ -170,6 +173,16 @@ function App() {
   useEffect(() => {
     saveSettings(config);
   }, [config]);
+
+  // Handle return from Stripe Checkout — refetch subscription to clear paywall
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('subscription') === 'success') {
+      refetchSubscription();
+      // Clean up the query param
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, [refetchSubscription]);
 
   // Load word frequency data on mount
   useEffect(() => {
@@ -727,6 +740,27 @@ function App() {
     );
   }
 
+  // Subscription loading state
+  if (subLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div>
+      </div>
+    );
+  }
+
+  // Paywall gate — must have active subscription or trial
+  if (needsPayment) {
+    return (
+      <PaywallScreen
+        status={subscription?.status || 'trialing'}
+        price={subscription?.price ?? 5}
+        onSubscribe={handleSubscribe}
+        onSignOut={signOut}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -1068,6 +1102,9 @@ function App() {
         cards={cards}
         userId={userId}
         onDeleteAccount={handleDeleteAccount}
+        subscription={subscription}
+        onManageSubscription={handleManageSubscription}
+        onSubscribe={handleSubscribe}
       />
 
       {/* Review panel */}

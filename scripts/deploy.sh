@@ -68,7 +68,7 @@ gcloud run deploy "$SERVICE" \
   --memory 1Gi \
   --timeout 300 \
   --max-instances 1 \
-  --set-secrets="OPENAI_API_KEY=openai-api-key:latest,GOOGLE_TRANSLATE_API_KEY=google-translate-key:latest,SENTRY_DSN=sentry-dsn:latest" \
+  --set-secrets="OPENAI_API_KEY=openai-api-key:latest,GOOGLE_TRANSLATE_API_KEY=google-translate-key:latest,SENTRY_DSN=sentry-dsn:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,STRIPE_PRICE_ID=stripe-price-id:latest" \
   --set-env-vars="GCS_BUCKET=russian-transcription-videos,GIT_SHA=$GIT_SHA"
 
 # 6. Verify deployment

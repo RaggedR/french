@@ -26,6 +26,7 @@ import { progressClients, sendProgress, createProgressCallback, friendlyErrorMes
 import { downloadAudioChunk, downloadVideoChunk, transcribeAudioChunk, addPunctuation, lemmatizeWords, getOkRuVideoInfo, isLibRuUrl, fetchLibRuText, generateTtsAudio, getAudioDuration, estimateWordTimestamps, BROWSER_UA } from './media.js';
 import { requireAuth, adminAuth } from './auth.js';
 import { trackCost, requireBudget, costs, trackTranslateCost, initUsageStore, flushAllUsage, getUserCost, getUserWeeklyCost, getUserMonthlyCost, DAILY_LIMIT, WEEKLY_LIMIT, MONTHLY_LIMIT } from './usage.js';
+import { requireSubscription, getSubscriptionStatus, createCheckoutSession, createPortalSession, cancelSubscription, handleWebhook, constructWebhookEvent, initSubscriptionStore } from './stripe.js';
 
 // Use system yt-dlp binary instead of bundled one (bundled version may be outdated)
 const ytdlp = ytdlpBase.create('yt-dlp');
@@ -128,7 +129,7 @@ app.use(helmet({
       'frame-src': ["'self'", "https://www.youtube.com", "https://accounts.google.com"],
       'object-src': ["'none'"],
       'base-uri': ["'self'"],
-      'form-action': ["'self'", "https://accounts.google.com"],
+      'form-action': ["'self'", "https://accounts.google.com", "https://checkout.stripe.com", "https://billing.stripe.com"],
     },
   },
   crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
@@ -145,6 +146,24 @@ app.use(cors({
     'http://localhost:3001',
   ],
 }));
+// Stripe webhook — must be registered BEFORE express.json() so raw body is
+// available for signature verification. This endpoint has no auth middleware
+// because it's authenticated via Stripe's webhook signature.
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'];
+  if (!signature) {
+    return res.status(400).json({ error: 'Missing stripe-signature header' });
+  }
+  try {
+    const event = constructWebhookEvent(req.body, signature);
+    await handleWebhook(event);
+    res.json({ received: true });
+  } catch (err) {
+    console.error('[Stripe] Webhook error:', err.message);
+    res.status(400).json({ error: 'Webhook signature verification failed' });
+  }
+});
+
 app.use(express.json());
 
 // Reverse proxy for Firebase reserved URLs (/__/auth/*, /__/firebase/*) —
@@ -213,6 +232,83 @@ app.get('/api/health', async (req, res) => {
 
   const healthy = checks.firestore !== false && checks.gcsConnected !== false;
   res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'degraded', ...checks });
+});
+
+// Local media endpoints — before auth middleware because <audio>/<video> elements can't send auth headers
+app.get('/api/local-video/:filename', (req, res) => {
+  if (!IS_LOCAL) {
+    return res.status(404).json({ error: 'Not available in production' });
+  }
+
+  const sessionId = req.params.filename.replace('.mp4', '');
+  const videoPath = localSessions.get(`video_${sessionId}`);
+
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    return res.status(404).json({ error: 'Video not found' });
+  }
+
+  const stat = fs.statSync(videoPath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = end - start + 1;
+    const file = fs.createReadStream(videoPath, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'video/mp4',
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'video/mp4',
+    });
+    fs.createReadStream(videoPath).pipe(res);
+  }
+});
+
+app.get('/api/local-audio/:filename', (req, res) => {
+  if (!IS_LOCAL) {
+    return res.status(404).json({ error: 'Not available in production' });
+  }
+
+  const key = req.params.filename.replace('.mp3', '');
+  const audioPath = localSessions.get(`audio_${key}`);
+
+  if (!audioPath || !fs.existsSync(audioPath)) {
+    return res.status(404).json({ error: 'Audio not found' });
+  }
+
+  const stat = fs.statSync(audioPath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = end - start + 1;
+    const file = fs.createReadStream(audioPath, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'audio/mpeg',
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'audio/mpeg',
+    });
+    fs.createReadStream(audioPath).pipe(res);
+  }
 });
 
 // Auth middleware — all /api routes below require a valid Firebase ID token
@@ -322,6 +418,59 @@ app.get('/api/usage', (req, res) => {
     weekly: { used: getUserWeeklyCost(req.uid), limit: WEEKLY_LIMIT },
     monthly: { used: getUserMonthlyCost(req.uid), limit: MONTHLY_LIMIT },
   });
+});
+
+// ---------------------------------------------------------------------------
+// Subscription management
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/subscription
+ * Returns current user's subscription status (trial, active, etc.)
+ */
+app.get('/api/subscription', async (req, res) => {
+  try {
+    const status = await getSubscriptionStatus(req.uid);
+    res.json(status);
+  } catch (err) {
+    console.error('[Stripe] Get subscription error:', err.message);
+    res.status(500).json({ error: 'Failed to get subscription status' });
+  }
+});
+
+/**
+ * POST /api/create-checkout-session
+ * Creates a Stripe Checkout session and returns the redirect URL.
+ */
+app.post('/api/create-checkout-session', async (req, res) => {
+  try {
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const { url } = await createCheckoutSession(req.uid, req.userEmail, origin);
+    res.json({ url });
+  } catch (err) {
+    console.error('[Stripe] Checkout session error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to create checkout session' });
+  }
+});
+
+/**
+ * POST /api/create-portal-session
+ * Creates a Stripe Customer Portal session for subscription management.
+ * Requires the user to have an existing Stripe customer ID.
+ */
+app.post('/api/create-portal-session', async (req, res) => {
+  try {
+    const status = await getSubscriptionStatus(req.uid);
+    if (!status.stripeCustomerId) {
+      return res.status(400).json({ error: 'No Stripe customer found. Subscribe first.' });
+    }
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const { url } = await createPortalSession(status.stripeCustomerId, origin);
+    res.json({ url });
+  } catch (err) {
+    console.error('[Stripe] Portal session error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to create portal session' });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -519,7 +668,20 @@ app.delete('/api/account', async (req, res) => {
       }
     }
 
-    // 4. Delete Firebase Auth user
+    // 4. Cancel Stripe subscription + delete subscriptions doc
+    try {
+      const subStatus = await getSubscriptionStatus(uid);
+      if (subStatus.stripeSubscriptionId) {
+        await cancelSubscription(subStatus.stripeSubscriptionId);
+      }
+      const { getFirestore: getFs } = await import('firebase-admin/firestore');
+      await getFs().collection('subscriptions').doc(uid).delete().catch(() => {});
+      console.log(`[Account] Deleted Stripe subscription data for ${uid}`);
+    } catch (err) {
+      console.log(`[Account] Stripe cleanup skipped:`, err.message);
+    }
+
+    // 5. Delete Firebase Auth user
     try {
       await adminAuth.deleteUser(uid);
       console.log(`[Account] Deleted Firebase Auth user ${uid}`);
@@ -540,7 +702,7 @@ app.delete('/api/account', async (req, res) => {
  * Accepts: { word: string }
  * Returns: { word: string, translation: string, sourceLanguage: string }
  */
-app.post('/api/translate', translateRateLimit, requireBudget, async (req, res) => {
+app.post('/api/translate', translateRateLimit, requireSubscription, requireBudget, async (req, res) => {
   const { word } = req.body;
   const apiKey = process.env.GOOGLE_TRANSLATE_API_KEY;
 
@@ -612,7 +774,7 @@ app.post('/api/translate', translateRateLimit, requireBudget, async (req, res) =
  * Accepts: { text: string, word: string }
  * Returns: { sentence: string, translation: string }
  */
-app.post('/api/extract-sentence', extractSentenceRateLimit, requireBudget, async (req, res) => {
+app.post('/api/extract-sentence', extractSentenceRateLimit, requireSubscription, requireBudget, async (req, res) => {
   const { text, word } = req.body;
 
   if (!text || !word) {
@@ -683,86 +845,6 @@ app.delete('/api/session/:sessionId', requireSessionOwnership, async (req, res) 
  * GET /api/local-video/:filename
  * Serve locally stored videos (development only)
  */
-app.get('/api/local-video/:filename', (req, res) => {
-  if (!IS_LOCAL) {
-    return res.status(404).json({ error: 'Not available in production' });
-  }
-
-  const sessionId = req.params.filename.replace('.mp4', '');
-  const videoPath = localSessions.get(`video_${sessionId}`);
-
-  if (!videoPath || !fs.existsSync(videoPath)) {
-    return res.status(404).json({ error: 'Video not found' });
-  }
-
-  const stat = fs.statSync(videoPath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunksize = end - start + 1;
-    const file = fs.createReadStream(videoPath, { start, end });
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunksize,
-      'Content-Type': 'video/mp4',
-    });
-    file.pipe(res);
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': 'video/mp4',
-    });
-    fs.createReadStream(videoPath).pipe(res);
-  }
-});
-
-/**
- * GET /api/local-audio/:filename
- * Serve locally stored TTS audio files (development only)
- */
-app.get('/api/local-audio/:filename', (req, res) => {
-  if (!IS_LOCAL) {
-    return res.status(404).json({ error: 'Not available in production' });
-  }
-
-  const key = req.params.filename.replace('.mp3', '');
-  const audioPath = localSessions.get(`audio_${key}`);
-
-  if (!audioPath || !fs.existsSync(audioPath)) {
-    return res.status(404).json({ error: 'Audio not found' });
-  }
-
-  const stat = fs.statSync(audioPath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunksize = end - start + 1;
-    const file = fs.createReadStream(audioPath, { start, end });
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunksize,
-      'Content-Type': 'audio/mpeg',
-    });
-    file.pipe(res);
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': 'audio/mpeg',
-    });
-    fs.createReadStream(audioPath).pipe(res);
-  }
-});
-
 /**
  * GET /api/hls/:sessionId/playlist.m3u8
  * Proxy and rewrite HLS manifest
@@ -973,7 +1055,7 @@ const MIN_FINAL_CHUNK = 120;      // Minimum final chunk duration in seconds (me
  * Returns: { sessionId, status: 'started' }
  * Progress sent via SSE, completion includes hasMoreChunks flag
  */
-app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireBudget, async (req, res) => {
+app.post('/api/analyze', analyzeRateLimit, analyzeDailyLimit, requireSubscription, requireBudget, async (req, res) => {
   const { url } = req.body;
   const apiKey = process.env.OPENAI_API_KEY;
 
@@ -1535,7 +1617,7 @@ app.get('/api/session/:sessionId/chunk/:chunkId', requireSessionOwnership, async
  * Request: { sessionId, chunkId, startTime, endTime }
  * Returns: { videoUrl, transcript }
  */
-app.post('/api/download-chunk', downloadChunkRateLimit, requireBudget, requireSessionOwnership, async (req, res) => {
+app.post('/api/download-chunk', downloadChunkRateLimit, requireSubscription, requireBudget, requireSessionOwnership, async (req, res) => {
   const { chunkId } = req.body;
   const { sessionId } = req;
   const session = req.analysisSession;
@@ -1932,6 +2014,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     cleanupOldSessions()
       .then(() => rebuildUrlCache())
       .then(() => initUsageStore())
+      .then(() => initSubscriptionStore())
       .catch(err => {
         console.error('[Startup] Cleanup/cache/usage rebuild failed:', err.message);
       });

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { TranslatorConfig, SRSCard } from '../types';
 import { getUsage } from '../services/api';
-import type { UsageData } from '../services/api';
+import type { UsageData, SubscriptionData } from '../services/api';
 import { TERMS_OF_SERVICE, PRIVACY_POLICY } from '../legal';
 
 interface SettingsPanelProps {
@@ -12,6 +12,9 @@ interface SettingsPanelProps {
   cards: SRSCard[];
   userId: string | null;
   onDeleteAccount: () => Promise<void>;
+  subscription: SubscriptionData | null;
+  onManageSubscription: () => Promise<void>;
+  onSubscribe: () => Promise<void>;
 }
 
 function UsageBar({ label, used, limit }: { label: string; used: number; limit: number }) {
@@ -38,6 +41,9 @@ export function SettingsPanel({
   cards,
   userId,
   onDeleteAccount,
+  subscription,
+  onManageSubscription,
+  onSubscribe,
 }: SettingsPanelProps) {
   const [expandedLegal, setExpandedLegal] = useState<'tos' | 'privacy' | null>(null);
   const [usage, setUsage] = useState<UsageData | null>(null);
@@ -164,6 +170,75 @@ export function SettingsPanel({
             {cards.length === 0 ? 'No cards to export' : `Export ${cards.length} cards`}
           </button>
         </div>
+
+        {/* Subscription */}
+        {userId && subscription && (
+          <div className="mb-6 border-t pt-6" data-testid="subscription-section">
+            <h3 className="text-sm font-medium text-gray-700 mb-2">Subscription</h3>
+            {subscription.status === 'trialing' && !subscription.needsPayment && (
+              <>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+                    Free trial
+                  </span>
+                  <span className="text-xs text-gray-500" data-testid="trial-days-remaining">
+                    {subscription.trialDaysRemaining} days remaining
+                  </span>
+                </div>
+                <button
+                  onClick={onSubscribe}
+                  className="w-full px-4 py-2 text-sm font-medium rounded-md border border-gray-300 bg-white hover:bg-gray-50 transition-colors"
+                >
+                  Subscribe now — {subscription.priceDisplay}
+                </button>
+              </>
+            )}
+            {subscription.status === 'active' && (
+              <>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+                    Active
+                  </span>
+                  {subscription.currentPeriodEnd && (
+                    <span className="text-xs text-gray-500">
+                      Next billing: {new Date(subscription.currentPeriodEnd).toLocaleDateString()}
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={onManageSubscription}
+                  data-testid="manage-subscription-btn"
+                  className="w-full px-4 py-2 text-sm font-medium rounded-md border border-gray-300 bg-white hover:bg-gray-50 transition-colors"
+                >
+                  Manage subscription
+                </button>
+              </>
+            )}
+            {subscription.status === 'past_due' && (
+              <>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
+                    Payment issue
+                  </span>
+                  <span className="text-xs text-gray-500">Retrying payment</span>
+                </div>
+                <button
+                  onClick={onManageSubscription}
+                  className="w-full px-4 py-2 text-sm font-medium rounded-md border border-yellow-300 bg-yellow-50 hover:bg-yellow-100 transition-colors text-yellow-800"
+                >
+                  Update payment method
+                </button>
+              </>
+            )}
+            {subscription.status === 'canceled' && (
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+                  Canceled
+                </span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Usage */}
         {userId && (

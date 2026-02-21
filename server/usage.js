@@ -5,7 +5,7 @@
  * A write-behind cache persists to Firestore with 5s debounce per user.
  * On startup, initUsageStore() hydrates Maps from Firestore.
  *
- * Combined API limits: $1/day, $5/week, $10/month (OpenAI + Google Translate)
+ * Combined API limits: $0.50/day, $2.50/week, $5/month (OpenAI + Google Translate)
  *
  * Cost estimates:
  *   Whisper:           $0.006 / minute of audio
@@ -21,9 +21,9 @@
 import { getFirestore } from 'firebase-admin/firestore';
 import * as Sentry from '@sentry/node';
 
-export const DAILY_LIMIT = 1.00;    // $1/day per user
-export const WEEKLY_LIMIT = 5.00;   // $5/week per user
-export const MONTHLY_LIMIT = 10.00; // $10/month per user
+export const DAILY_LIMIT = 0.50;    // $0.50/day per user
+export const WEEKLY_LIMIT = 2.50;   // $2.50/week per user
+export const MONTHLY_LIMIT = 5.00;  // $5/month per user
 
 // Combined API costs: uid -> { cost, date/week/month }
 const dailyCosts = new Map();
@@ -240,17 +240,17 @@ export function getRemainingBudget(uid) {
 export function requireBudget(req, res, next) {
   if (getUserMonthlyCost(req.uid) >= MONTHLY_LIMIT) {
     return res.status(429).json({
-      error: 'Monthly API limit reached ($10/month). Please try again next month.',
+      error: `Monthly API limit reached ($${MONTHLY_LIMIT.toFixed(2)}/month). Please try again next month.`,
     });
   }
   if (getUserWeeklyCost(req.uid) >= WEEKLY_LIMIT) {
     return res.status(429).json({
-      error: 'Weekly API limit reached ($5/week). Please try again next week.',
+      error: `Weekly API limit reached ($${WEEKLY_LIMIT.toFixed(2)}/week). Please try again next week.`,
     });
   }
   if (getUserCost(req.uid) >= DAILY_LIMIT) {
     return res.status(429).json({
-      error: 'Daily API limit reached ($1/day). Please try again tomorrow.',
+      error: `Daily API limit reached ($${DAILY_LIMIT.toFixed(2)}/day). Please try again tomorrow.`,
     });
   }
   next();

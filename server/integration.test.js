@@ -37,14 +37,14 @@ vi.mock('./usage.js', () => ({
   trackCost: () => {},
   trackTranslateCost: () => {},
   getUserCost: () => 0.55,          // Combined: 0.45 (OpenAI) + 0.10 (Translate)
-  getUserWeeklyCost: () => 1.60,     // Combined: 1.20 + 0.40
-  getUserMonthlyCost: () => 4.50,    // Combined: 3.50 + 1.00
+  getUserWeeklyCost: () => 0.80,     // Combined: 0.60 + 0.20
+  getUserMonthlyCost: () => 2.25,    // Combined: 1.75 + 0.50
   getRemainingBudget: () => 1,
   initUsageStore: vi.fn().mockResolvedValue(undefined),
   flushAllUsage: vi.fn().mockResolvedValue(undefined),
-  DAILY_LIMIT: 1.00,
-  WEEKLY_LIMIT: 5.00,
-  MONTHLY_LIMIT: 10.00,
+  DAILY_LIMIT: 0.50,
+  WEEKLY_LIMIT: 2.50,
+  MONTHLY_LIMIT: 5.00,
   costs: {
     whisper: () => 0,
     gpt4o: () => 0,
@@ -53,6 +53,32 @@ vi.mock('./usage.js', () => ({
     translate: () => 0,
   },
 }));
+
+// ---------------------------------------------------------------------------
+// Mock stripe.js — bypass subscription checks in integration tests
+// ---------------------------------------------------------------------------
+
+vi.mock('./stripe.js', () => ({
+  requireSubscription: (req, res, next) => next(),
+  getSubscriptionStatus: vi.fn().mockResolvedValue({
+    status: 'trialing',
+    trialEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    trialDaysRemaining: 30,
+    currentPeriodEnd: null,
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    needsPayment: false,
+  }),
+  createCheckoutSession: vi.fn().mockResolvedValue({ url: 'https://checkout.stripe.com/test' }),
+  createPortalSession: vi.fn().mockResolvedValue({ url: 'https://billing.stripe.com/test' }),
+  cancelSubscription: vi.fn().mockResolvedValue(undefined),
+  handleWebhook: vi.fn().mockResolvedValue(undefined),
+  constructWebhookEvent: vi.fn().mockImplementation((body) => JSON.parse(body)),
+  initSubscriptionStore: vi.fn().mockResolvedValue(undefined),
+  clearSubscriptionCacheForTesting: vi.fn(),
+}));
+
+import { getSubscriptionStatus, createCheckoutSession } from './stripe.js';
 
 // ---------------------------------------------------------------------------
 // Mock media.js — replaces all 5 external-facing functions
@@ -1482,9 +1508,9 @@ describe('Q. GET /api/usage', () => {
     const body = await res.json();
 
     // Combined API buckets (OpenAI + Translate)
-    expect(body.daily).toEqual({ used: 0.55, limit: 1.00 });
-    expect(body.weekly).toEqual({ used: 1.60, limit: 5.00 });
-    expect(body.monthly).toEqual({ used: 4.50, limit: 10.00 });
+    expect(body.daily).toEqual({ used: 0.55, limit: 0.50 });
+    expect(body.weekly).toEqual({ used: 0.80, limit: 2.50 });
+    expect(body.monthly).toEqual({ used: 2.25, limit: 5.00 });
   });
 });
 
@@ -1776,5 +1802,89 @@ describe('S. POST /api/demo', () => {
     } finally {
       cleanupDemoJson('video');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T. Subscription Endpoints
+// ---------------------------------------------------------------------------
+
+describe('T. Subscription Endpoints', () => {
+  it('GET /api/subscription returns subscription status', async () => {
+    const res = await fetch(`${baseUrl}/api/subscription`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe('trialing');
+    expect(body.trialDaysRemaining).toBe(30);
+    expect(body.needsPayment).toBe(false);
+  });
+
+  it('POST /api/create-checkout-session returns a URL', async () => {
+    const res = await fetch(`${baseUrl}/api/create-checkout-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.url).toBe('https://checkout.stripe.com/test');
+  });
+
+  it('POST /api/create-portal-session returns 400 without Stripe customer', async () => {
+    const res = await fetch(`${baseUrl}/api/create-portal-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/no stripe customer/i);
+  });
+
+  it('POST /api/create-portal-session returns URL when user has Stripe customer', async () => {
+    // Override mock to return a user with a stripeCustomerId
+    getSubscriptionStatus.mockResolvedValueOnce({
+      status: 'active',
+      trialEnd: new Date().toISOString(),
+      trialDaysRemaining: 0,
+      currentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      stripeCustomerId: 'cus_test_123',
+      stripeSubscriptionId: 'sub_test_456',
+      needsPayment: false,
+    });
+
+    const res = await fetch(`${baseUrl}/api/create-portal-session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.url).toBe('https://billing.stripe.com/test');
+  });
+
+  it('POST /api/webhook is accessible without auth', async () => {
+    // The webhook route is registered before auth middleware,
+    // but needs a stripe-signature header
+    const res = await fetch(`${baseUrl}/api/webhook`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'stripe-signature': 'test_sig',
+      },
+      body: JSON.stringify({ type: 'test.event', data: { object: {} } }),
+    });
+    // Should be 200 (mock constructWebhookEvent returns the parsed body)
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.received).toBe(true);
+  });
+
+  it('POST /api/webhook returns 400 without stripe-signature', async () => {
+    const res = await fetch(`${baseUrl}/api/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'test.event', data: { object: {} } }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/missing stripe-signature/i);
   });
 });

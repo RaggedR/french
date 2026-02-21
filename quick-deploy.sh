@@ -36,7 +36,7 @@ gcloud run deploy russian-transcription \
     --memory 1Gi \
     --timeout 300 \
     --max-instances $MAX_INSTANCES \
-    --set-secrets="OPENAI_API_KEY=openai-api-key:latest,GOOGLE_TRANSLATE_API_KEY=google-translate-key:latest" \
+    --set-secrets="OPENAI_API_KEY=openai-api-key:latest,GOOGLE_TRANSLATE_API_KEY=google-translate-key:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,STRIPE_PRICE_ID=stripe-price-id:latest" \
     --set-env-vars="GCS_BUCKET=russian-transcription-videos"
 
 echo "Cleaning up old Docker images..."

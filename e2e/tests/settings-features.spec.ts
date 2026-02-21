@@ -128,8 +128,8 @@ test.describe('Usage display', () => {
     await expect(page.locator('text=OpenAI + Google Translate (merged into single budget)')).toBeVisible();
 
     // Check that combined usage values are rendered (from mock /api/usage response)
-    await expect(page.locator('text=$0.55 / $1.00')).toBeVisible();   // Daily: 0.45 + 0.10
-    await expect(page.locator('text=$4.50 / $10.00')).toBeVisible();  // Monthly: 3.50 + 1.00
+    await expect(page.locator('text=$0.25 / $0.50')).toBeVisible();   // Daily: 0.20 + 0.05
+    await expect(page.locator('text=$2.25 / $5.00')).toBeVisible();   // Monthly: 1.75 + 0.50
   });
 });
 

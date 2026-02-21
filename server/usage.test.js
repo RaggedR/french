@@ -150,38 +150,38 @@ describe('usage.js', () => {
 
   describe('getRemainingBudget', () => {
     it('returns full daily budget for new user', () => {
-      expect(getRemainingBudget(uid)).toBe(1.00);
+      expect(getRemainingBudget(uid)).toBe(0.50);
     });
 
     it('returns remaining after costs', () => {
-      trackCost(uid, 0.30);
-      expect(getRemainingBudget(uid)).toBeCloseTo(0.70);
+      trackCost(uid, 0.15);
+      expect(getRemainingBudget(uid)).toBeCloseTo(0.35);
     });
 
     it('returns 0 when daily limit exceeded', () => {
-      trackCost(uid, 1.00);
+      trackCost(uid, 0.50);
       expect(getRemainingBudget(uid)).toBe(0);
     });
 
     it('is constrained by weekly limit', () => {
-      // Spend $4.90 over multiple "days" within the same week
+      // Spend $2.25 over multiple "days" within the same week
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-03-09T10:00:00Z')); // Monday
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-10T10:00:00Z')); // Tuesday
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-11T10:00:00Z')); // Wednesday
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-12T10:00:00Z')); // Thursday
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-13T10:00:00Z')); // Friday
-      trackCost(uid, 0.90);
-      // Weekly total: $4.50, daily today: $0.90
-      // Daily remaining: 1.00 - 0.90 = 0.10
-      // Weekly remaining: 5.00 - 4.50 = 0.50
-      // Monthly remaining: 10.00 - 4.50 = 5.50
-      // Min = 0.10
-      expect(getRemainingBudget(uid)).toBeCloseTo(0.10);
+      trackCost(uid, 0.45);
+      // Weekly total: $2.25, daily today: $0.45
+      // Daily remaining: 0.50 - 0.45 = 0.05
+      // Weekly remaining: 2.50 - 2.25 = 0.25
+      // Monthly remaining: 5.00 - 2.25 = 2.75
+      // Min = 0.05
+      expect(getRemainingBudget(uid)).toBeCloseTo(0.05);
     });
   });
 
@@ -195,8 +195,8 @@ describe('usage.js', () => {
       expect(res.statusCode).toBeNull();
     });
 
-    it('blocks at daily limit ($1)', () => {
-      trackCost(uid, 1.00);
+    it('blocks at daily limit ($0.50)', () => {
+      trackCost(uid, 0.50);
       const { req, res, next, wasNextCalled } = mockReqResNext(uid);
       requireBudget(req, res, next);
       expect(wasNextCalled()).toBe(false);
@@ -204,22 +204,22 @@ describe('usage.js', () => {
       expect(res.body.error).toContain('Daily');
     });
 
-    it('blocks at weekly limit ($5)', () => {
+    it('blocks at weekly limit ($2.50)', () => {
       vi.useFakeTimers();
       // Spread across days to stay under daily, but exceed weekly
       vi.setSystemTime(new Date('2026-03-09T10:00:00Z'));
-      trackCost(uid, 0.99);
+      trackCost(uid, 0.49);
       vi.setSystemTime(new Date('2026-03-10T10:00:00Z'));
-      trackCost(uid, 0.99);
+      trackCost(uid, 0.49);
       vi.setSystemTime(new Date('2026-03-11T10:00:00Z'));
-      trackCost(uid, 0.99);
+      trackCost(uid, 0.49);
       vi.setSystemTime(new Date('2026-03-12T10:00:00Z'));
-      trackCost(uid, 0.99);
+      trackCost(uid, 0.49);
       vi.setSystemTime(new Date('2026-03-13T10:00:00Z'));
-      trackCost(uid, 0.99);
+      trackCost(uid, 0.49);
       vi.setSystemTime(new Date('2026-03-14T10:00:00Z'));
       trackCost(uid, 0.10);
-      // Weekly: $5.05, daily today: $0.10
+      // Weekly: $2.55, daily today: $0.10
 
       const { req, res, next, wasNextCalled } = mockReqResNext(uid);
       requireBudget(req, res, next);
@@ -228,38 +228,38 @@ describe('usage.js', () => {
       expect(res.body.error).toContain('Weekly');
     });
 
-    it('blocks at monthly limit ($10)', () => {
+    it('blocks at monthly limit ($5)', () => {
       vi.useFakeTimers();
       // Spread across weeks to stay under weekly, but exceed monthly
       vi.setSystemTime(new Date('2026-03-02T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-03T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-04T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-05T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-06T10:00:00Z'));
-      trackCost(uid, 0.40);
-      // Week 10 total: $4.00
+      trackCost(uid, 0.20);
+      // Week 10 total: $2.00
 
       vi.setSystemTime(new Date('2026-03-09T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-10T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-11T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-12T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-13T10:00:00Z'));
-      trackCost(uid, 0.90);
-      // Week 11 total: $4.50, monthly: $8.50
+      trackCost(uid, 0.45);
+      // Week 11 total: $2.25, monthly: $4.25
 
       vi.setSystemTime(new Date('2026-03-16T10:00:00Z'));
-      trackCost(uid, 0.90);
+      trackCost(uid, 0.45);
       vi.setSystemTime(new Date('2026-03-17T10:00:00Z'));
-      trackCost(uid, 0.90);
-      // Week 12 total: $1.80, monthly: $10.20
+      trackCost(uid, 0.45);
+      // Week 12 total: $0.90, monthly: $5.15
 
       const { req, res, next, wasNextCalled } = mockReqResNext(uid);
       requireBudget(req, res, next);
@@ -298,9 +298,9 @@ describe('usage.js', () => {
 
   describe('exported limit constants', () => {
     it('exports combined API limits', () => {
-      expect(DAILY_LIMIT).toBe(1.00);
-      expect(WEEKLY_LIMIT).toBe(5.00);
-      expect(MONTHLY_LIMIT).toBe(10.00);
+      expect(DAILY_LIMIT).toBe(0.50);
+      expect(WEEKLY_LIMIT).toBe(2.50);
+      expect(MONTHLY_LIMIT).toBe(5.00);
     });
   });
 

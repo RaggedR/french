@@ -351,3 +351,34 @@ export async function loadDemo(type: 'video' | 'text'): Promise<DemoResponse> {
     body: JSON.stringify({ type }),
   });
 }
+
+/**
+ * Subscription data returned by GET /api/subscription
+ */
+export interface SubscriptionData {
+  status: 'trialing' | 'active' | 'past_due' | 'canceled';
+  trialEnd: string | null;
+  trialDaysRemaining: number;
+  currentPeriodEnd: string | null;
+  stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  needsPayment: boolean;
+  price: number;
+  priceDisplay: string;
+}
+
+export async function getSubscription(): Promise<SubscriptionData> {
+  return apiRequest<SubscriptionData>('/api/subscription');
+}
+
+export async function createCheckoutSession(): Promise<{ url: string }> {
+  return apiRequest<{ url: string }>('/api/create-checkout-session', {
+    method: 'POST',
+  });
+}
+
+export async function createPortalSession(): Promise<{ url: string }> {
+  return apiRequest<{ url: string }>('/api/create-portal-session', {
+    method: 'POST',
+  });
+}
