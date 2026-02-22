@@ -469,6 +469,10 @@ app.post('/api/generate-examples', requireSubscription, requireBudget, async (re
     return res.status(400).json({ error: 'Too many words (max 50)' });
   }
 
+  if (!words.every(w => typeof w === 'string' && w.length > 0 && w.length <= 200)) {
+    return res.status(400).json({ error: 'Each word must be a non-empty string (max 200 chars)' });
+  }
+
   if (!process.env.OPENAI_API_KEY) {
     return res.status(500).json({ error: 'Example generation service not configured' });
   }
@@ -500,11 +504,17 @@ app.post('/api/generate-examples', requireSubscription, requireBudget, async (re
     }
 
     const data = await response.json();
-    const examples = JSON.parse(data.choices[0].message.content);
+    let examples;
+    try {
+      examples = JSON.parse(data.choices[0].message.content);
+    } catch {
+      throw new Error('GPT returned invalid JSON for example sentences');
+    }
     trackCost(req.uid, costs.gpt4oMini());
     res.json({ examples });
   } catch (error) {
     console.error('[GenerateExamples] Error:', error);
+    Sentry.captureException(error, { tags: { operation: 'generate_examples' } });
     res.status(500).json({ error: error.message || 'Example generation failed' });
   }
 });

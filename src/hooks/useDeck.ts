@@ -109,16 +109,24 @@ export function useDeck(userId: string | null) {
       if (needsExamples.length === 0) return;
 
       try {
-        const words = needsExamples.map(c => c.word);
-        const { examples } = await apiRequest<{ examples: Record<string, { russian: string; english: string } | null> }>(
-          '/api/generate-examples',
-          { method: 'POST', body: JSON.stringify({ words }) },
-        );
+        // Batch in chunks of 50 to respect server limit
+        const BATCH_SIZE = 50;
+        let allExamples: Record<string, { russian: string; english: string } | null> = {};
+        for (let i = 0; i < needsExamples.length; i += BATCH_SIZE) {
+          if (cancelled) return;
+          const batch = needsExamples.slice(i, i + BATCH_SIZE);
+          const words = batch.map(c => c.word);
+          const { examples } = await apiRequest<{ examples: Record<string, { russian: string; english: string } | null> }>(
+            '/api/generate-examples',
+            { method: 'POST', body: JSON.stringify({ words }) },
+          );
+          allExamples = { ...allExamples, ...examples };
+        }
         if (cancelled) return;
 
         const enriched = latestCards.map(c => {
-          if (c.dictionary && !c.dictionary.example && examples[c.word]) {
-            return { ...c, dictionary: { ...c.dictionary, example: examples[c.word]! } };
+          if (c.dictionary && !c.dictionary.example && allExamples[c.word]) {
+            return { ...c, dictionary: { ...c.dictionary, example: allExamples[c.word]! } };
           }
           return c;
         });

@@ -2132,6 +2132,40 @@ describe('V. POST /api/generate-examples', () => {
     expect(body.error).toMatch(/at least one word/i);
   });
 
+  it('returns 400 when words contains non-string items', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: ['книга', 123, null] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/non-empty string/i);
+  });
+
+  it('returns 400 when words contains empty strings', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: ['книга', ''] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/non-empty string/i);
+  });
+
+  it('returns 400 when a word exceeds 200 characters', async () => {
+    const longWord = 'а'.repeat(201);
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: [longWord] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/max 200/i);
+  });
+
   it('handles GPT API errors gracefully', async () => {
     const mockErrorResponse = {
       ok: false,
@@ -2155,6 +2189,39 @@ describe('V. POST /api/generate-examples', () => {
       expect(res.status).toBe(500);
       const body = await res.json();
       expect(body.error).toBeTruthy();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('handles invalid JSON from GPT gracefully', async () => {
+    const mockBadJsonResponse = {
+      ok: true,
+      json: async () => ({
+        choices: [{
+          message: { content: 'this is not valid json {{{' },
+        }],
+        usage: { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 },
+      }),
+    };
+
+    const originalFetch = globalThis.fetch;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, ...args) => {
+      if (typeof url === 'string' && url.includes('openai.com')) {
+        return Promise.resolve(mockBadJsonResponse);
+      }
+      return originalFetch(url, ...args);
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/generate-examples`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ words: ['тест'] }),
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toMatch(/invalid JSON/i);
     } finally {
       vi.restoreAllMocks();
     }

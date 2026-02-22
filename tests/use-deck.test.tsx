@@ -741,4 +741,46 @@ describe('useDeck', () => {
     expect(result.current.cards[0].dictionary?.example).toEqual(exampleData);
     vi.useFakeTimers();
   });
+
+  it('batches example generation in chunks of 50', async () => {
+    vi.useRealTimers();
+    const dictionaryEntry = { stressedForm: 'те́ст', pos: 'noun', translations: ['test'] };
+    // Create 75 cards that all need examples (have dictionary but no example)
+    const firestoreCards = Array.from({ length: 75 }, (_, i) => ({
+      id: `word${i}`, word: `Word${i}`, translation: `Trans${i}`, sourceLanguage: 'ru',
+      dictionary: dictionaryEntry,
+      easeFactor: 2.5, interval: 0, repetition: 0,
+      nextReviewDate: new Date(Date.now() - 1000).toISOString(),
+      addedAt: new Date().toISOString(), lastReviewedAt: null,
+    }));
+    mockGetDoc.mockResolvedValue(firestoreSnap({ cards: firestoreCards }));
+
+    mockApiRequest.mockImplementation((url: string) => {
+      if (url.includes('generate-examples')) {
+        return Promise.resolve({ examples: {} });
+      }
+      return Promise.reject(new Error('Unexpected API call'));
+    });
+
+    renderHook(() => useDeck('user-batch-examples'));
+
+    await act(async () => {
+      await new Promise(r => setTimeout(r, 300));
+    });
+
+    // Should have made 2 batch calls: 50 + 25
+    const exampleCalls = mockApiRequest.mock.calls.filter(
+      (c: unknown[]) => (c[0] as string).includes('generate-examples')
+    );
+    expect(exampleCalls).toHaveLength(2);
+
+    // First batch should have 50 words
+    const firstBody = JSON.parse((exampleCalls[0][1] as { body: string }).body);
+    expect(firstBody.words).toHaveLength(50);
+
+    // Second batch should have 25 words
+    const secondBody = JSON.parse((exampleCalls[1][1] as { body: string }).body);
+    expect(secondBody.words).toHaveLength(25);
+    vi.useFakeTimers();
+  });
 });
