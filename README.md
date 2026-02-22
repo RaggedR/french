@@ -1,5 +1,7 @@
 # Russian Video Transcription
 
+**Live app: https://russian-transcription-fl6fjkunbq-uc.a.run.app/**
+
 A web app for watching Russian videos with synced transcripts and click-to-translate functionality. Paste a video URL, get a word-by-word transcript, and click any word to see its English translation.
 
 ## Features

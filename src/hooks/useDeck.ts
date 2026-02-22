@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import * as Sentry from '@sentry/react';
 import type { SRSCard, SRSRating, DictionaryEntry } from '../types';
 import { createCard, sm2, getDueCards as getDueCardsFromAll, normalizeCardId } from '../utils/sm2';
+import { apiRequest } from '../services/api';
 
 const DECK_KEY = 'srs_deck';
 const DEBOUNCE_MS = 500;
@@ -76,7 +77,68 @@ export function useDeck(userId: string | null) {
 
     let cancelled = false;
 
+    async function enrichMissingDictionary(loadedCards: SRSCard[]): Promise<SRSCard[]> {
+      const needsEnrichment = loadedCards.filter(c => !c.dictionary);
+      if (needsEnrichment.length === 0) return loadedCards;
+
+      try {
+        const words = needsEnrichment.map(c => ({ word: c.word }));
+        const { entries } = await apiRequest<{ entries: Record<string, DictionaryEntry | null> }>(
+          '/api/enrich-deck',
+          { method: 'POST', body: JSON.stringify({ words }) },
+        );
+        if (cancelled) return loadedCards;
+
+        const enriched = loadedCards.map(c => {
+          if (!c.dictionary && entries[c.word]) {
+            return { ...c, dictionary: entries[c.word]! };
+          }
+          return c;
+        });
+        setCards(enriched);
+        saveToFirestore(enriched);
+        return enriched;
+      } catch {
+        // Enrichment is best-effort — cards still work without dictionary data
+        return loadedCards;
+      }
+    }
+
+    async function enrichMissingExamples(latestCards: SRSCard[]) {
+      const needsExamples = latestCards.filter(c => c.dictionary && !c.dictionary.example);
+      if (needsExamples.length === 0) return;
+
+      try {
+        // Batch in chunks of 50 to respect server limit
+        const BATCH_SIZE = 50;
+        let allExamples: Record<string, { russian: string; english: string } | null> = {};
+        for (let i = 0; i < needsExamples.length; i += BATCH_SIZE) {
+          if (cancelled) return;
+          const batch = needsExamples.slice(i, i + BATCH_SIZE);
+          const words = batch.map(c => c.word);
+          const { examples } = await apiRequest<{ examples: Record<string, { russian: string; english: string } | null> }>(
+            '/api/generate-examples',
+            { method: 'POST', body: JSON.stringify({ words }) },
+          );
+          allExamples = { ...allExamples, ...examples };
+        }
+        if (cancelled) return;
+
+        const enriched = latestCards.map(c => {
+          if (c.dictionary && !c.dictionary.example && allExamples[c.word]) {
+            return { ...c, dictionary: { ...c.dictionary, example: allExamples[c.word]! } };
+          }
+          return c;
+        });
+        setCards(enriched);
+        saveToFirestore(enriched);
+      } catch {
+        // Example generation is best-effort — cards still work without examples
+      }
+    }
+
     async function load() {
+      let loadedCards: SRSCard[] = [];
       try {
         const { doc, getDoc, setDoc, serverTimestamp, db } = await getFirestoreHelpers();
         const deckRef = doc(db, 'decks', userId!);
@@ -85,12 +147,14 @@ export function useDeck(userId: string | null) {
 
         if (snap.exists() && snap.data().cards?.length > 0) {
           // Firestore has data — use it
-          setCards(snap.data().cards);
+          loadedCards = snap.data().cards;
+          setCards(loadedCards);
         } else {
           // Firestore empty — check localStorage for migration
           const local = loadLocalDeck();
           if (local.length > 0) {
-            setCards(local);
+            loadedCards = local;
+            setCards(loadedCards);
             // Migrate to Firestore, then clear localStorage
             await setDoc(deckRef, { cards: local, updatedAt: serverTimestamp() });
             localStorage.removeItem(DECK_KEY);
@@ -99,18 +163,23 @@ export function useDeck(userId: string | null) {
       } catch {
         // Firestore unavailable — fall back to localStorage
         if (!cancelled) {
-          setCards(loadLocalDeck());
+          loadedCards = loadLocalDeck();
+          setCards(loadedCards);
         }
       }
       if (!cancelled) {
         loadedUserRef.current = userId;
         setLoaded(true);
+        // Enrich cards: (1) free dictionary lookup, then (2) GPT example generation
+        enrichMissingDictionary(loadedCards).then(latestCards => {
+          if (!cancelled) enrichMissingExamples(latestCards);
+        });
       }
     }
 
     load();
     return () => { cancelled = true; };
-  }, [userId]);
+  }, [userId, saveToFirestore]);
 
   // Cleanup debounce timer on unmount
   useEffect(() => {

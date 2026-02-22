@@ -79,6 +79,7 @@ vi.mock('./stripe.js', () => ({
 }));
 
 import { getSubscriptionStatus, createCheckoutSession } from './stripe.js';
+import { lookupWord } from './dictionary.js';
 
 // ---------------------------------------------------------------------------
 // Mock dictionary.js — bypass CSV loading in tests
@@ -1919,5 +1920,348 @@ describe('T. Subscription Endpoints', () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error).toMatch(/missing stripe-signature/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// U. POST /api/enrich-deck — Batch Dictionary Lookup
+// ---------------------------------------------------------------------------
+
+describe('U. POST /api/enrich-deck', () => {
+  it('returns dictionary entries keyed by word', async () => {
+    lookupWord.mockImplementation((word) => {
+      if (word === 'привет') return { stressedForm: 'приве́т', pos: 'other', translations: ['hello', 'hi'] };
+      if (word === 'книга') return { stressedForm: 'кни́га', pos: 'noun', translations: ['book'] };
+      return null;
+    });
+
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        words: [
+          { word: 'привет' },
+          { word: 'книга' },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.entries['привет']).toEqual({ stressedForm: 'приве́т', pos: 'other', translations: ['hello', 'hi'] });
+    expect(body.entries['книга']).toEqual({ stressedForm: 'кни́га', pos: 'noun', translations: ['book'] });
+  });
+
+  it('returns null for unknown words', async () => {
+    lookupWord.mockReturnValue(null);
+
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        words: [{ word: 'несуществующее' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.entries['несуществующее']).toBeNull();
+  });
+
+  it('passes lemma to lookupWord when provided', async () => {
+    lookupWord.mockReturnValue({ stressedForm: 'кни́га', pos: 'noun', translations: ['book'] });
+
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        words: [{ word: 'книги', lemma: 'книга' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    // lookupWord should be called with both word and lemma
+    expect(lookupWord).toHaveBeenCalledWith('книги', 'книга');
+  });
+
+  it('returns 400 when words is missing', async () => {
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/words.*required/i);
+  });
+
+  it('returns 400 when words is not an array', async () => {
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: 'not-an-array' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/words.*required/i);
+  });
+
+  it('returns 400 when words array exceeds 500 items', async () => {
+    const words = Array.from({ length: 501 }, (_, i) => ({ word: `слово${i}` }));
+
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/too many/i);
+  });
+
+  it('skips entries with missing word key', async () => {
+    lookupWord.mockReturnValue({ stressedForm: 'кни́га', pos: 'noun', translations: ['book'] });
+
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        words: [
+          { word: 'книга' },
+          { lemma: 'only-lemma' },  // missing word key
+          {},                        // empty object
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Only 'книга' should be in entries — the others are skipped
+    expect(Object.keys(body.entries)).toEqual(['книга']);
+  });
+
+  it('handles empty words array gracefully', async () => {
+    const res = await fetch(`${baseUrl}/api/enrich-deck`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: [] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.entries).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// V. POST /api/generate-examples — GPT-4o-mini Example Sentences
+// ---------------------------------------------------------------------------
+
+describe('V. POST /api/generate-examples', () => {
+  it('returns example sentences keyed by word', async () => {
+    const mockGptResponse = {
+      ok: true,
+      json: async () => ({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              'книга': { russian: 'Я читаю интересную книгу.', english: 'I am reading an interesting book.' },
+              'дом': { russian: 'Мой дом находится далеко.', english: 'My house is far away.' },
+            }),
+          },
+        }],
+        usage: { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 },
+      }),
+    };
+
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((url, ...args) => {
+      if (typeof url === 'string' && url.includes('openai.com')) {
+        return Promise.resolve(mockGptResponse);
+      }
+      return originalFetch(url, ...args);
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/generate-examples`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ words: ['книга', 'дом'] }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      expect(body.examples['книга']).toEqual({
+        russian: 'Я читаю интересную книгу.',
+        english: 'I am reading an interesting book.',
+      });
+      expect(body.examples['дом']).toEqual({
+        russian: 'Мой дом находится далеко.',
+        english: 'My house is far away.',
+      });
+
+      // Verify OpenAI API was called
+      const openaiCalls = fetchSpy.mock.calls.filter(
+        c => typeof c[0] === 'string' && c[0].includes('openai.com')
+      );
+      expect(openaiCalls.length).toBe(1);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('returns 400 when words is missing', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/words.*required/i);
+  });
+
+  it('returns 400 when words is not an array', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: 'not-an-array' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/words.*required/i);
+  });
+
+  it('returns 400 when words array exceeds 50 items', async () => {
+    const words = Array.from({ length: 51 }, (_, i) => `слово${i}`);
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/too many/i);
+  });
+
+  it('returns 400 when words array is empty', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: [] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/at least one word/i);
+  });
+
+  it('returns 400 when words contains non-string items', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: ['книга', 123, null] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/non-empty string/i);
+  });
+
+  it('returns 400 when words contains empty strings', async () => {
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: ['книга', ''] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/non-empty string/i);
+  });
+
+  it('returns 400 when a word exceeds 200 characters', async () => {
+    const longWord = 'а'.repeat(201);
+    const res = await fetch(`${baseUrl}/api/generate-examples`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: [longWord] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/max 200/i);
+  });
+
+  it('handles GPT API errors gracefully', async () => {
+    const mockErrorResponse = {
+      ok: false,
+      json: async () => ({ error: { message: 'Rate limited' } }),
+    };
+
+    const originalFetch = globalThis.fetch;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, ...args) => {
+      if (typeof url === 'string' && url.includes('openai.com')) {
+        return Promise.resolve(mockErrorResponse);
+      }
+      return originalFetch(url, ...args);
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/generate-examples`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ words: ['тест'] }),
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toBeTruthy();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('handles invalid JSON from GPT gracefully', async () => {
+    const mockBadJsonResponse = {
+      ok: true,
+      json: async () => ({
+        choices: [{
+          message: { content: 'this is not valid json {{{' },
+        }],
+        usage: { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 },
+      }),
+    };
+
+    const originalFetch = globalThis.fetch;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, ...args) => {
+      if (typeof url === 'string' && url.includes('openai.com')) {
+        return Promise.resolve(mockBadJsonResponse);
+      }
+      return originalFetch(url, ...args);
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/generate-examples`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ words: ['тест'] }),
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toMatch(/invalid JSON/i);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('returns 500 when OPENAI_API_KEY is not set', async () => {
+    const origKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+
+    try {
+      const res = await fetch(`${baseUrl}/api/generate-examples`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ words: ['тест'] }),
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toMatch(/not configured/i);
+    } finally {
+      process.env.OPENAI_API_KEY = origKey;
+    }
   });
 });

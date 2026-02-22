@@ -37,7 +37,7 @@ function loadSettings(): TranslatorConfig {
   } catch {
     // Ignore errors
   }
-  return { freqRangeMin: 500, freqRangeMax: 1000 };
+  return { freqRangeMin: 1000, freqRangeMax: 2000 };
 }
 
 function saveSettings(config: TranslatorConfig) {
@@ -58,7 +58,7 @@ function FrequencyControls({ config, onConfigChange }: {
     if (isEnabled) {
       onConfigChange({ ...config, freqRangeMin: undefined, freqRangeMax: undefined });
     } else {
-      onConfigChange({ ...config, freqRangeMin: 500, freqRangeMax: 1000 });
+      onConfigChange({ ...config, freqRangeMin: 1000, freqRangeMax: 2000 });
     }
   };
 

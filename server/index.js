@@ -423,6 +423,103 @@ app.get('/api/usage', (req, res) => {
   });
 });
 
+/**
+ * POST /api/enrich-deck
+ * Batch dictionary lookup for cards missing dictionary data.
+ * Free endpoint (in-memory lookups, no external API calls).
+ * Accepts: { words: [{ word: string, lemma?: string }] }
+ * Returns: { entries: { [word]: DictionaryEntry | null } }
+ */
+app.post('/api/enrich-deck', (req, res) => {
+  const { words } = req.body;
+
+  if (!words || !Array.isArray(words)) {
+    return res.status(400).json({ error: 'words array is required' });
+  }
+
+  if (words.length > 500) {
+    return res.status(400).json({ error: 'Too many words (max 500)' });
+  }
+
+  const entries = {};
+  for (const { word, lemma } of words) {
+    if (!word) continue;
+    entries[word] = lookupWord(word, lemma) || null;
+  }
+  res.json({ entries });
+});
+
+/**
+ * POST /api/generate-examples
+ * Uses GPT-4o-mini to generate A2-B1 level example sentences for a batch of Russian words.
+ * Accepts: { words: [string] }   (max 50)
+ * Returns: { examples: { [word]: { russian: string, english: string } | null } }
+ */
+app.post('/api/generate-examples', requireSubscription, requireBudget, async (req, res) => {
+  const { words } = req.body;
+
+  if (!words || !Array.isArray(words)) {
+    return res.status(400).json({ error: 'words array is required' });
+  }
+
+  if (words.length === 0) {
+    return res.status(400).json({ error: 'At least one word is required' });
+  }
+
+  if (words.length > 50) {
+    return res.status(400).json({ error: 'Too many words (max 50)' });
+  }
+
+  if (!words.every(w => typeof w === 'string' && w.length > 0 && w.length <= 200)) {
+    return res.status(400).json({ error: 'Each word must be a non-empty string (max 200 chars)' });
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'Example generation service not configured' });
+  }
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{
+          role: 'system',
+          content: 'You are a Russian language tutor. For each Russian word provided, generate one simple example sentence at A2-B1 level (5-12 words). Use the word in a natural inflected form. Return a JSON object mapping each word to { "russian": "<sentence>", "english": "<translation>" }.',
+        }, {
+          role: 'user',
+          content: words.join('\n'),
+        }],
+        response_format: { type: 'json_object' },
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error?.message || 'Example generation failed');
+    }
+
+    const data = await response.json();
+    let examples;
+    try {
+      examples = JSON.parse(data.choices[0].message.content);
+    } catch {
+      throw new Error('GPT returned invalid JSON for example sentences');
+    }
+    trackCost(req.uid, costs.gpt4oMini());
+    res.json({ examples });
+  } catch (error) {
+    console.error('[GenerateExamples] Error:', error);
+    Sentry.captureException(error, { tags: { operation: 'generate_examples' } });
+    res.status(500).json({ error: error.message || 'Example generation failed' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Subscription management
 // ---------------------------------------------------------------------------

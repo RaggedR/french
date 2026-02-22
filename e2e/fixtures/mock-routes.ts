@@ -119,6 +119,24 @@ export async function setupMockRoutes(page: Page, options: {
     });
   });
 
+  // POST /api/enrich-deck → batch dictionary lookup (return empty for E2E)
+  await page.route('**/api/enrich-deck', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ entries: {} }),
+    });
+  });
+
+  // POST /api/generate-examples → GPT example sentences (return empty for E2E)
+  await page.route('**/api/generate-examples', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ examples: {} }),
+    });
+  });
+
   // POST /api/extract-sentence → sentence + translation
   await page.route('**/api/extract-sentence', async (route) => {
     await route.fulfill({

@@ -224,6 +224,8 @@ Express.js on port 3001 (local) / `PORT` env var (Cloud Run). Key files:
 | GET | `/api/progress/:sessionId` | auth + owner | SSE stream for progress events |
 | GET | `/api/usage` | auth | Per-user unified API cost consumption (combined budget) |
 | DELETE | `/api/account` | auth | Delete account: Firestore + GCS + in-memory + Auth cleanup |
+| POST | `/api/enrich-deck` | auth | Batch dictionary lookup for cards missing dictionary data (free, in-memory) |
+| POST | `/api/generate-examples` | auth + sub + budget | GPT-4o-mini batch example sentence generation for flashcards (max 50 words) |
 | POST | `/api/demo` | auth | Load pre-processed demo (no budget — no API calls) |
 | GET | `/api/local-video/:filename` | auth | Serve local demo video files (dev only) |
 | GET | `/api/local-audio/:filename` | auth | Serve local demo audio files (dev only) |

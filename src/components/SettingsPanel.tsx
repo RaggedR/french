@@ -124,13 +124,13 @@ export function SettingsPanel({
             Word Frequency Underlining
           </label>
           <p className="text-xs text-gray-500 mb-3">
-            Underline words by frequency rank. Rank 1 = most common (и, в, не), rank 1000 = intermediate. Leave empty to disable.
+            Underline words by frequency rank (from Anna Karenina). Rank 1 = most common (и, он, она), rank 1000 = intermediate, rank 2000+ = rare. Leave empty to disable.
           </p>
           <div className="flex gap-2 items-center">
             <input
               type="number"
               min={1}
-              max={20003}
+              max={12252}
               value={config.freqRangeMin ?? ''}
               onChange={(e) => onConfigChange({
                 ...config,
@@ -143,7 +143,7 @@ export function SettingsPanel({
             <input
               type="number"
               min={1}
-              max={20003}
+              max={12252}
               value={config.freqRangeMax ?? ''}
               onChange={(e) => onConfigChange({
                 ...config,
@@ -154,7 +154,7 @@ export function SettingsPanel({
             />
           </div>
           <p className="text-xs text-gray-400 mt-1">
-            e.g., 1–5000 (matches lemmatized forms via GPT-4o)
+            e.g., 1000–2000 (based on Anna Karenina word frequencies)
           </p>
         </div>
 
